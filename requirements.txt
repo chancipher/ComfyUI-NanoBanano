@@ -1,0 +1,5 @@
+google-generativeai>=0.8.0
+torch>=1.11.0
+pillow>=8.3.0
+numpy>=1.21.0
+requests>=2.25.0
