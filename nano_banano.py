@@ -6,6 +6,7 @@ from io import BytesIO
 from PIL import Image
 import torch
 import numpy as np
+import cv2  # NEW: for robust image decoding (WebP, etc.)
 
 p = os.path.dirname(os.path.realpath(__file__))
 
@@ -22,6 +23,72 @@ def save_config(config):
     config_path = os.path.join(p, 'config.json')
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
+
+# NEW: robust decoder for various response encodings (raw bytes, webp, base64-wrapped, data URLs)
+def _decode_image_to_numpy(img_bytes, mime_hint=""):
+    # 1) Try PIL directly
+    try:
+        im = Image.open(BytesIO(img_bytes))
+        im.load()
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        return np.array(im).astype(np.float32) / 255.0
+    except Exception:
+        pass
+
+    # 2) Try OpenCV directly
+    try:
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        mat = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        if mat is not None:
+            if mat.ndim == 2:
+                mat = cv2.cvtColor(mat, cv2.COLOR_GRAY2RGB)
+            elif mat.shape[2] == 4:
+                mat = cv2.cvtColor(mat, cv2.COLOR_BGRA2RGB)
+            else:
+                mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
+            return mat.astype(np.float32) / 255.0
+    except Exception:
+        pass
+
+    # 3) If the bytes actually contain ASCII/base64 content (or data URL), try base64 decode
+    try:
+        s = img_bytes.decode("ascii", errors="ignore").strip()
+        if s.startswith("data:"):
+            comma = s.find(",")
+            if comma != -1:
+                s = s[comma + 1:]
+        s_clean = "".join(s.split())
+        decoded = base64.b64decode(s_clean, validate=False)
+
+        # Retry PIL
+        try:
+            im = Image.open(BytesIO(decoded))
+            im.load()
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            return np.array(im).astype(np.float32) / 255.0
+        except Exception:
+            pass
+
+        # Retry OpenCV
+        try:
+            arr = np.frombuffer(decoded, dtype=np.uint8)
+            mat = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+            if mat is not None:
+                if mat.ndim == 2:
+                    mat = cv2.cvtColor(mat, cv2.COLOR_GRAY2RGB)
+                elif mat.shape[2] == 4:
+                    mat = cv2.cvtColor(mat, cv2.COLOR_BGRA2RGB)
+                else:
+                    mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
+                return mat.astype(np.float32) / 255.0
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    raise ValueError(f"Failed to decode image (mime={mime_hint}) with PIL/ OpenCV/ base64.")
 
 class ComfyUI_NanoBanana:
     def __init__(self, api_key=None):
@@ -155,36 +222,31 @@ class ComfyUI_NanoBanana:
         return torch.from_numpy(image_array).unsqueeze(0)
 
     def prepare_images_for_api(self, img1=None, img2=None, img3=None, img4=None, img5=None):
-        """Convert up to 5 tensor images to base64 format for API"""
+        """Convert up to 5 tensor images to raw PNG bytes for API (resized ≤2048px)"""
         encoded_images = []
-        
-        # Process all provided images (up to 5)
         for i, img in enumerate([img1, img2, img3, img4, img5], 1):
-            if img is not None:
-                # Handle both single images and batched images
-                if isinstance(img, torch.Tensor):
-                    if len(img.shape) == 4:  # Batch of images
-                        # Take only the first image from batch to avoid confusion
-                        pil_image = self.tensor_to_image(img[0])
-                    else:  # Single image
-                        pil_image = self.tensor_to_image(img)
-                    
-                    # Note: Gemini API automatically determines output resolution
-                    # No resizing is done as the API handles this internally
-                    encoded_images.append(self._image_to_base64(pil_image))
-        
+            if img is None:
+                continue
+            if isinstance(img, torch.Tensor):
+                if len(img.shape) == 4:
+                    pil_image = self.tensor_to_image(img[0])
+                else:
+                    pil_image = self.tensor_to_image(img)
+                # Resize to keep payload/API happy
+                pil_image = self.resize_image(pil_image, max_size=2048)
+                encoded_images.append(self._image_to_base64(pil_image))
         return encoded_images
-    
+
     def _image_to_base64(self, pil_image):
-        """Convert PIL image to base64 format for API"""
+        """Convert PIL image to raw PNG bytes payload expected by SDK"""
         img_byte_arr = BytesIO()
         pil_image.save(img_byte_arr, format='PNG')
         img_bytes = img_byte_arr.getvalue()
-        
+        # Return bytes directly; SDK will wrap as Blob
         return {
             "inline_data": {
                 "mime_type": "image/png",
-                "data": base64.b64encode(img_bytes).decode('utf-8')
+                "data": img_bytes,  # bytes, not base64 string
             }
         }
 
@@ -231,101 +293,110 @@ class ComfyUI_NanoBanana:
 
     def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety):
         """Make API call to Gemini 2.5 Flash Image using the working v6 approach"""
-        
         try:
-            # Set up the Google Generative AI client (like in v6)
             from google import genai
             from google.genai import types
-            
+
             client = genai.Client(api_key=self.api_key)
-            
-            # Set up generation config with response_modalities for image generation
+
             generation_config = types.GenerateContentConfig(
                 temperature=temperature,
-                response_modalities=['Text', 'Image']  # Critical for image generation
+                response_modalities=['Text', 'Image']
             )
-            
-            # Set up content with proper encoding (like v6 does)
-            parts = [{"text": prompt}]
-            
+
+            # Build parts with text and image bytes
+            parts = [types.Part(text=prompt)]
             for img_data in encoded_images:
-                parts.append({
-                    "inline_data": {
-                        "mime_type": "image/png",
-                        "data": img_data["inline_data"]["data"]
-                    }
-                })
-            
-            content_parts = [{"parts": parts}]
-            
-            # Track all generated images
+                # Be robust if data was accidentally base64-encoded
+                data_field = img_data.get("inline_data", {}).get("data", b"")
+                if isinstance(data_field, str):
+                    try:
+                        data_bytes = base64.b64decode(data_field)
+                    except Exception:
+                        continue
+                else:
+                    data_bytes = data_field
+                mime = img_data.get("inline_data", {}).get("mime_type", "image/png")
+                parts.append(
+                    types.Part(
+                        inline_data=types.Blob(
+                            mime_type=mime,
+                            data=data_bytes
+                        )
+                    )
+                )
+
+            contents = [types.Content(role="user", parts=parts)]
+
             all_generated_images = []
             operation_log = ""
-            
-            # Generate images for each batch (like v6)
+
             for i in range(batch_count):
                 try:
-                    # Generate content using the working v6 approach
                     response = client.models.generate_content(
                         model="gemini-2.5-flash-image-preview",
-                        contents=content_parts,
+                        contents=contents,
                         config=generation_config
                     )
-                    
-                    # Extract images from the response (v6 method)
                     batch_images = []
                     response_text = ""
-                    
+
                     if hasattr(response, 'candidates') and response.candidates:
                         for candidate in response.candidates:
                             if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
                                 for part in candidate.content.parts:
-                                    # Extract text
                                     if hasattr(part, 'text') and part.text:
                                         response_text += part.text + "\n"
-                                    
-                                    # Extract images (v6 method)
+                                    # Image parts are returned as inline_data Blob
                                     if hasattr(part, 'inline_data') and part.inline_data:
                                         try:
-                                            image_binary = part.inline_data.data
-                                            batch_images.append(image_binary)
+                                            mime = getattr(part.inline_data, "mime_type", None) or "image/png"
+                                            image_binary = part.inline_data.data  # bytes or base64 string
+                                            if isinstance(image_binary, str):
+                                                try:
+                                                    image_binary = base64.b64decode(image_binary)
+                                                except Exception:
+                                                    image_binary = b""
+                                            if isinstance(image_binary, (bytes, bytearray)) and len(image_binary) > 0:
+                                                # Keep bytes and mime for robust decoding later
+                                                batch_images.append({"data": bytes(image_binary), "mime": mime})
                                         except Exception as img_error:
                                             operation_log += f"Error extracting image: {str(img_error)}\n"
-                    
+
                     if batch_images:
                         all_generated_images.extend(batch_images)
                         operation_log += f"Batch {i+1}: Generated {len(batch_images)} images\n"
                     else:
                         operation_log += f"Batch {i+1}: No images found. Text: {response_text[:100]}...\n"
-                
+
                 except Exception as batch_error:
                     operation_log += f"Batch {i+1} error: {str(batch_error)}\n"
-            
-            # Process generated images into tensors (v6 method)
+
             generated_tensors = []
             if all_generated_images:
-                for img_binary in all_generated_images:
+                for item in all_generated_images:
                     try:
-                        # Convert binary to PIL image
-                        image = Image.open(BytesIO(img_binary))
-                        
-                        # Ensure it's RGB
-                        if image.mode != "RGB":
-                            image = image.convert("RGB")
-                        
-                        # Convert to numpy array and normalize
-                        img_np = np.array(image).astype(np.float32) / 255.0
-                        
-                        # Create tensor with correct dimensions
+                        # item may be dict with data/mime or raw bytes (legacy)
+                        if isinstance(item, dict):
+                            img_bytes = item.get("data", b"")
+                            mime = item.get("mime", "application/octet-stream")
+                        else:
+                            img_bytes = item
+                            mime = "application/octet-stream"
+
+                        # Use robust decoder
+                        img_np = _decode_image_to_numpy(img_bytes, mime_hint=mime)
+
                         img_tensor = torch.from_numpy(img_np)[None,]
                         generated_tensors.append(img_tensor)
                     except Exception as e:
-                        operation_log += f"Error processing image: {e}\n"
-            
+                        # Log a short hex prefix for debugging
+                        hex_head = img_bytes[:12].hex() if isinstance(img_bytes, (bytes, bytearray)) else "n/a"
+                        operation_log += f"Error processing image: {e} head={hex_head}\n"
+
             return generated_tensors, operation_log
-            
+
         except ImportError:
-            # Fallback to requests if google.genai not available
             operation_log = "google.genai not available, using requests fallback\n"
             return [], operation_log
         except Exception as e:
