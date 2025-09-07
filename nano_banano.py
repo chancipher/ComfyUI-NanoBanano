@@ -267,7 +267,7 @@ class ComfyUI_NanoBanana:
                 try:
                     # Generate content using the working v6 approach
                     response = client.models.generate_content(
-                        model="gemini-2.0-flash-exp-image-generation",
+                        model="gemini-2.5-flash-image-preview",
                         contents=content_parts,
                         config=generation_config
                     )
