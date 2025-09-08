@@ -163,9 +163,9 @@ class ComfyUI_NanoBanana:
                 "seed": ("INT", {
                     "default": -1,
                     "min": -1,
-                    "max": 2147483647,
+                    "max": 9007199254740991,
                     "step": 1,
-                    "tooltip": "Random seed (-1 = auto). Model may ignore this and not be fully deterministic."
+                    "tooltip": "Random seed (-1 = auto). Large seeds will be normalized to 32-bit for determinism."
                 }),
                 "quality": (["standard", "high"], {
                     "default": "high",
@@ -298,6 +298,18 @@ class ComfyUI_NanoBanana:
             final_prompt += " Maintain character consistency and visual identity from the reference images."
             
         return final_prompt
+
+    def _normalize_seed(self, seed):
+        """Normalize any large seed into 32-bit non-negative range"""
+        try:
+            s = int(seed)
+        except Exception:
+            return None, None
+        if s < 0:
+            return None, None
+        max32 = (1 << 31) - 1  # 2147483647
+        norm = s % (max32 + 1)  # -> [0, 2147483647]
+        return s, norm
 
     def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety, seed=None):
         """Make API call to Gemini 2.5 Flash Image using the working v6 approach"""
@@ -445,14 +457,15 @@ class ComfyUI_NanoBanana:
             return (self.create_placeholder_image(), error_msg)
 
         try:
-            # NEW: best-effort local seeding (does not force server determinism)
-            if seed is not None and seed >= 0:
+            # NEW: normalize seed and apply locally (server may ignore)
+            req_seed, norm_seed = self._normalize_seed(seed)
+            if norm_seed is not None:
                 try:
-                    random.seed(seed)
-                    np.random.seed(seed)
-                    torch.manual_seed(seed)
+                    random.seed(norm_seed)
+                    np.random.seed(norm_seed)
+                    torch.manual_seed(norm_seed)
                     if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(seed)
+                        torch.cuda.manual_seed_all(norm_seed)
                 except Exception:
                     pass
 
@@ -480,7 +493,9 @@ class ComfyUI_NanoBanana:
             operation_log += f"Reference Images: {len(encoded_images)}\n"
             operation_log += f"Batch Count: {batch_count}\n"
             operation_log += f"Temperature: {temperature}\n"
-            operation_log += f"Seed: {seed if (seed is not None and seed >= 0) else 'auto'}\n"
+            operation_log += f"Seed: {req_seed if (req_seed is not None) else 'auto'}\n"
+            if req_seed is not None and req_seed != norm_seed:
+                operation_log += f"Normalized seed (32-bit): {norm_seed}\n"
             operation_log += f"Quality: {quality}\n"
             operation_log += f"Aspect Ratio: {aspect_ratio}\n"
             operation_log += f"Character Consistency: {character_consistency}\n"
@@ -488,10 +503,10 @@ class ComfyUI_NanoBanana:
             operation_log += f"Note: Output resolution determined by API (max ~1024px)\n"
             operation_log += f"Prompt: {final_prompt[:150]}...\n\n"
             
-            # Make API call
+            # Make API call with normalized seed
             generated_images, api_log = self.call_nano_banana_api(
                 final_prompt, encoded_images, temperature, batch_count, enable_safety,
-                seed=(seed if (seed is not None and seed >= 0) else None)
+                seed=norm_seed
             )
             
             operation_log += api_log
