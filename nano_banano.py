@@ -7,6 +7,7 @@ from PIL import Image
 import torch
 import numpy as np
 import cv2  # NEW: for robust image decoding (WebP, etc.)
+import random  # NEW: optional local seeding
 
 p = os.path.dirname(os.path.realpath(__file__))
 
@@ -159,6 +160,13 @@ class ComfyUI_NanoBanana:
                     "step": 0.1,
                     "tooltip": "Creativity level (0.0 = deterministic, 1.0 = very creative)"
                 }),
+                "seed": ("INT", {
+                    "default": -1,
+                    "min": -1,
+                    "max": 2147483647,
+                    "step": 1,
+                    "tooltip": "Random seed (-1 = auto). Model may ignore this and not be fully deterministic."
+                }),
                 "quality": (["standard", "high"], {
                     "default": "high",
                     "tooltip": "Image generation quality"
@@ -291,7 +299,7 @@ class ComfyUI_NanoBanana:
             
         return final_prompt
 
-    def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety):
+    def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety, seed=None):
         """Make API call to Gemini 2.5 Flash Image using the working v6 approach"""
         try:
             from google import genai
@@ -299,10 +307,21 @@ class ComfyUI_NanoBanana:
 
             client = genai.Client(api_key=self.api_key)
 
-            generation_config = types.GenerateContentConfig(
-                temperature=temperature,
-                response_modalities=['Text', 'Image']
-            )
+            # NEW: try to pass seed if supported by SDK/model
+            seed_applied = False
+            try:
+                generation_config = types.GenerateContentConfig(
+                    temperature=temperature,
+                    response_modalities=['Text', 'Image'],
+                    seed=seed if (seed is not None and seed >= 0) else None
+                )
+                if seed is not None and seed >= 0:
+                    seed_applied = True
+            except TypeError:
+                generation_config = types.GenerateContentConfig(
+                    temperature=temperature,
+                    response_modalities=['Text', 'Image']
+                )
 
             # Build parts with text and image bytes
             parts = [types.Part(text=prompt)]
@@ -330,6 +349,11 @@ class ComfyUI_NanoBanana:
 
             all_generated_images = []
             operation_log = ""
+            # NEW: seed status note
+            if seed is not None and seed >= 0:
+                operation_log += f"Seed requested: {seed}\n"
+                if not seed_applied:
+                    operation_log += "Seed parameter not supported by current SDK/model; determinism not guaranteed.\n"
 
             for i in range(batch_count):
                 try:
@@ -406,7 +430,7 @@ class ComfyUI_NanoBanana:
     def nano_banana_generate(self, prompt, operation, reference_image_1=None, reference_image_2=None, 
                            reference_image_3=None, reference_image_4=None, reference_image_5=None, api_key="", 
                            batch_count=1, temperature=0.7, quality="high", aspect_ratio="1:1",
-                           character_consistency=True, enable_safety=True):
+                           character_consistency=True, enable_safety=True, seed=-1):
         
         # Validate and set API key
         if api_key.strip():
@@ -421,6 +445,17 @@ class ComfyUI_NanoBanana:
             return (self.create_placeholder_image(), error_msg)
 
         try:
+            # NEW: best-effort local seeding (does not force server determinism)
+            if seed is not None and seed >= 0:
+                try:
+                    random.seed(seed)
+                    np.random.seed(seed)
+                    torch.manual_seed(seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(seed)
+                except Exception:
+                    pass
+
             # Process reference images (up to 5)
             encoded_images = self.prepare_images_for_api(
                 reference_image_1, reference_image_2, reference_image_3, reference_image_4, reference_image_5
@@ -445,6 +480,7 @@ class ComfyUI_NanoBanana:
             operation_log += f"Reference Images: {len(encoded_images)}\n"
             operation_log += f"Batch Count: {batch_count}\n"
             operation_log += f"Temperature: {temperature}\n"
+            operation_log += f"Seed: {seed if (seed is not None and seed >= 0) else 'auto'}\n"
             operation_log += f"Quality: {quality}\n"
             operation_log += f"Aspect Ratio: {aspect_ratio}\n"
             operation_log += f"Character Consistency: {character_consistency}\n"
@@ -454,7 +490,8 @@ class ComfyUI_NanoBanana:
             
             # Make API call
             generated_images, api_log = self.call_nano_banana_api(
-                final_prompt, encoded_images, temperature, batch_count, enable_safety
+                final_prompt, encoded_images, temperature, batch_count, enable_safety,
+                seed=(seed if (seed is not None and seed >= 0) else None)
             )
             
             operation_log += api_log
