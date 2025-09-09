@@ -430,14 +430,18 @@ class ComfyUI_NanoBanana:
                         hex_head = img_bytes[:12].hex() if isinstance(img_bytes, (bytes, bytearray)) else "n/a"
                         operation_log += f"Error processing image: {e} head={hex_head}\n"
 
+            # NEW: if nothing generated, raise instead of returning empty
+            if not generated_tensors:
+                raise RuntimeError(f"Google image generation returned no images.\n{operation_log.strip()}")
+
             return generated_tensors, operation_log
 
-        except ImportError:
-            operation_log = "google.genai not available, using requests fallback\n"
-            return [], operation_log
+        except ImportError as ie:
+            # NEW: bubble up ImportError
+            raise ImportError("google.genai not available. Please install google-genai and ensure paid API access.") from ie
         except Exception as e:
-            operation_log = f"Error in v6 method: {str(e)}\n"
-            return [], operation_log
+            # NEW: bubble up other errors
+            raise RuntimeError(f"Error in v6 method: {str(e)}") from e
 
     def nano_banana_generate(self, prompt, operation, reference_image_1=None, reference_image_2=None, 
                            reference_image_3=None, reference_image_4=None, reference_image_5=None, api_key="", 
@@ -526,10 +530,9 @@ class ComfyUI_NanoBanana:
                 operation_log += "\nNo images were generated. Check the log above for details."
                 return (self.create_placeholder_image(), operation_log)
                 
-        except Exception as e:
-            error_log = f"NANO BANANA ERROR: {str(e)}\n"
-            error_log += "Please check your API key, internet connection, and paid tier status."
-            return (self.create_placeholder_image(), error_log)
+        except Exception:
+            # NEW: re-raise so ComfyUI surfaces the error directly
+            raise
 
 # Node registration
 NODE_CLASS_MAPPINGS = {
