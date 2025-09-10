@@ -8,6 +8,7 @@ import torch
 import numpy as np
 import cv2  # NEW: for robust image decoding (WebP, etc.)
 import random  # NEW: optional local seeding
+import time  # NEW: for retry backoff
 
 p = os.path.dirname(os.path.realpath(__file__))
 
@@ -311,8 +312,8 @@ class ComfyUI_NanoBanana:
         norm = s % (max32 + 1)  # -> [0, 2147483647]
         return s, norm
 
-    def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety, seed=None):
-        """Make API call to Gemini 2.5 Flash Image using the working v6 approach"""
+    def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety, seed=None, retries=3):
+        """Make API call to Gemini 2.5 Flash Image using the working v6 approach with retries per batch"""
         try:
             from google import genai
             from google.genai import types
@@ -368,45 +369,56 @@ class ComfyUI_NanoBanana:
                     operation_log += "Seed parameter not supported by current SDK/model; determinism not guaranteed.\n"
 
             for i in range(batch_count):
-                try:
-                    response = client.models.generate_content(
-                        model="gemini-2.5-flash-image-preview",
-                        contents=contents,
-                        config=generation_config
-                    )
-                    batch_images = []
-                    response_text = ""
+                batch_images = []
+                response_text = ""
+                last_error = None
+                for attempt in range(1, int(max(1, retries)) + 1):
+                    try:
+                        response = client.models.generate_content(
+                            model="gemini-2.5-flash-image-preview",
+                            contents=contents,
+                            config=generation_config
+                        )
+                        # Parse response into batch_images/response_text
+                        if hasattr(response, 'candidates') and response.candidates:
+                            for candidate in response.candidates:
+                                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                                    for part in candidate.content.parts:
+                                        if hasattr(part, 'text') and part.text:
+                                            response_text += part.text + "\n"
+                                        if hasattr(part, 'inline_data') and part.inline_data:
+                                            try:
+                                                mime = getattr(part.inline_data, "mime_type", None) or "image/png"
+                                                image_binary = part.inline_data.data  # bytes or base64 string
+                                                if isinstance(image_binary, str):
+                                                    try:
+                                                        image_binary = base64.b64decode(image_binary)
+                                                    except Exception:
+                                                        image_binary = b""
+                                                if isinstance(image_binary, (bytes, bytearray)) and len(image_binary) > 0:
+                                                    batch_images.append({"data": bytes(image_binary), "mime": mime})
+                                            except Exception as img_error:
+                                                operation_log += f"Error extracting image: {str(img_error)}\n"
+                        # success -> break retry loop
+                        break
+                    except Exception as e:
+                        last_error = e
+                        if attempt < retries:
+                            operation_log += f"Batch {i+1} attempt {attempt} failed: {e}; retrying...\n"
+                            time.sleep(min(2.0, 0.5 * attempt))
+                        else:
+                            operation_log += f"Batch {i+1} failed after {retries} attempts: {e}\n"
 
-                    if hasattr(response, 'candidates') and response.candidates:
-                        for candidate in response.candidates:
-                            if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
-                                for part in candidate.content.parts:
-                                    if hasattr(part, 'text') and part.text:
-                                        response_text += part.text + "\n"
-                                    # Image parts are returned as inline_data Blob
-                                    if hasattr(part, 'inline_data') and part.inline_data:
-                                        try:
-                                            mime = getattr(part.inline_data, "mime_type", None) or "image/png"
-                                            image_binary = part.inline_data.data  # bytes or base64 string
-                                            if isinstance(image_binary, str):
-                                                try:
-                                                    image_binary = base64.b64decode(image_binary)
-                                                except Exception:
-                                                    image_binary = b""
-                                            if isinstance(image_binary, (bytes, bytearray)) and len(image_binary) > 0:
-                                                # Keep bytes and mime for robust decoding later
-                                                batch_images.append({"data": bytes(image_binary), "mime": mime})
-                                        except Exception as img_error:
-                                            operation_log += f"Error extracting image: {str(img_error)}\n"
-
-                    if batch_images:
-                        all_generated_images.extend(batch_images)
-                        operation_log += f"Batch {i+1}: Generated {len(batch_images)} images\n"
+                if batch_images:
+                    all_generated_images.extend(batch_images)
+                    operation_log += f"Batch {i+1}: Generated {len(batch_images)} images\n"
+                else:
+                    # if we had response_text (e.g., safety or text-only) log a snippet
+                    snippet = (response_text[:100] + "...") if response_text else ""
+                    if last_error is not None and not response_text:
+                        operation_log += f"Batch {i+1}: No images. Last error: {last_error}\n"
                     else:
-                        operation_log += f"Batch {i+1}: No images found. Text: {response_text[:100]}...\n"
-
-                except Exception as batch_error:
-                    operation_log += f"Batch {i+1} error: {str(batch_error)}\n"
+                        operation_log += f"Batch {i+1}: No images found. Text: {snippet}\n"
 
             generated_tensors = []
             if all_generated_images:
@@ -446,7 +458,7 @@ class ComfyUI_NanoBanana:
     def nano_banana_generate(self, prompt, operation, reference_image_1=None, reference_image_2=None, 
                            reference_image_3=None, reference_image_4=None, reference_image_5=None, api_key="", 
                            batch_count=1, temperature=0.7, quality="high", aspect_ratio="1:1",
-                           character_consistency=True, enable_safety=True, seed=-1):
+                           character_consistency=True, enable_safety=True, seed=-1, retries=3):
         
         # Validate and set API key
         if api_key.strip():
@@ -500,6 +512,7 @@ class ComfyUI_NanoBanana:
             operation_log += f"Seed: {req_seed if (req_seed is not None) else 'auto'}\n"
             if req_seed is not None and req_seed != norm_seed:
                 operation_log += f"Normalized seed (32-bit): {norm_seed}\n"
+            operation_log += f"Retries: {int(max(1, retries))}\n"  # NEW
             operation_log += f"Quality: {quality}\n"
             operation_log += f"Aspect Ratio: {aspect_ratio}\n"
             operation_log += f"Character Consistency: {character_consistency}\n"
@@ -507,10 +520,10 @@ class ComfyUI_NanoBanana:
             operation_log += f"Note: Output resolution determined by API (max ~1024px)\n"
             operation_log += f"Prompt: {final_prompt[:150]}...\n\n"
             
-            # Make API call with normalized seed
+            # Make API call with normalized seed and retries
             generated_images, api_log = self.call_nano_banana_api(
                 final_prompt, encoded_images, temperature, batch_count, enable_safety,
-                seed=norm_seed
+                seed=norm_seed, retries=int(max(1, retries))
             )
             
             operation_log += api_log
