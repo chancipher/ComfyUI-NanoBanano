@@ -26,6 +26,16 @@ def save_config(config):
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
 
+# NEW: small helpers for debug formatting
+def _fmt_ms(seconds):
+    return f"{seconds * 1000:.1f} ms"
+
+def _safe_len(b):
+    try:
+        return len(b)
+    except Exception:
+        return 0
+
 # NEW: robust decoder for various response encodings (raw bytes, webp, base64-wrapped, data URLs)
 def _decode_image_to_numpy(img_bytes, mime_hint=""):
     # 1) Try PIL directly
@@ -185,6 +195,11 @@ class ComfyUI_NanoBanana:
                     "default": True,
                     "tooltip": "Enable content safety filters"
                 }),
+                # NEW: debug toggle
+                "debug_logging": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Print detailed timing and payload info for bottleneck analysis"
+                }),
             }
         }
 
@@ -312,16 +327,33 @@ class ComfyUI_NanoBanana:
         norm = s % (max32 + 1)  # -> [0, 2147483647]
         return s, norm
 
-    def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety, seed=None, retries=3):
+    # NEW: add debug_logging parameter to control detailed logs
+    def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety, seed=None, retries=3, debug_logging=False):
         """Make API call to Gemini 2.5 Flash Image using the working v6 approach with retries per batch"""
+        overall_t0 = time.perf_counter()
+        pre_debug_lines = []
+        operation_log = ""  # moved before emit
+
+        # NEW: immediate logger
+        def emit(msg):
+            nonlocal operation_log
+            operation_log += msg if msg.endswith("\n") else (msg + "\n")
+            if debug_logging:
+                try:
+                    print(msg, end="" if msg.endswith("\n") else "\n", flush=True)
+                except Exception:
+                    pass
+
         try:
+            sdk_t0 = time.perf_counter()
             from google import genai
             from google.genai import types
-
             client = genai.Client(api_key=self.api_key)
+            pre_debug_lines.append(f"SDK client init: {_fmt_ms(time.perf_counter() - sdk_t0)}")
 
             # NEW: try to pass seed if supported by SDK/model
             seed_applied = False
+            cfg_t0 = time.perf_counter()
             try:
                 generation_config = types.GenerateContentConfig(
                     temperature=temperature,
@@ -335,9 +367,12 @@ class ComfyUI_NanoBanana:
                     temperature=temperature,
                     response_modalities=['Text', 'Image']
                 )
+            pre_debug_lines.append(f"Build generation config: {_fmt_ms(time.perf_counter() - cfg_t0)}")
 
             # Build parts with text and image bytes
+            parts_t0 = time.perf_counter()
             parts = [types.Part(text=prompt)]
+            total_input_image_bytes = 0
             for img_data in encoded_images:
                 # Be robust if data was accidentally base64-encoded
                 data_field = img_data.get("inline_data", {}).get("data", b"")
@@ -348,6 +383,7 @@ class ComfyUI_NanoBanana:
                         continue
                 else:
                     data_bytes = data_field
+                total_input_image_bytes += _safe_len(data_bytes)
                 mime = img_data.get("inline_data", {}).get("mime_type", "image/png")
                 parts.append(
                     types.Part(
@@ -357,29 +393,40 @@ class ComfyUI_NanoBanana:
                         )
                     )
                 )
-
             contents = [types.Content(role="user", parts=parts)]
+            pre_debug_lines.append(
+                f"Build parts: {_fmt_ms(time.perf_counter() - parts_t0)} "
+                f"(prompt_len={len(prompt)}, ref_images={len(encoded_images)}, payload≈{total_input_image_bytes/1024:.1f} KB)"
+            )
 
-            all_generated_images = []
-            operation_log = ""
+            if debug_logging and pre_debug_lines:
+                emit("DEBUG TIMINGS (SDK/build):")
+                for line in pre_debug_lines:
+                    emit(line)
+
             # NEW: seed status note
             if seed is not None and seed >= 0:
-                operation_log += f"Seed requested: {seed}\n"
+                emit(f"Seed requested: {seed}")
                 if not seed_applied:
-                    operation_log += "Seed parameter not supported by current SDK/model; determinism not guaranteed.\n"
+                    emit("Seed parameter not supported by current SDK/model; determinism not guaranteed.")
 
+            all_generated_images = []
             for i in range(batch_count):
                 batch_images = []
                 response_text = ""
                 last_error = None
                 for attempt in range(1, int(max(1, retries)) + 1):
                     try:
+                        req_t0 = time.perf_counter()
                         response = client.models.generate_content(
                             model="gemini-2.5-flash-image-preview",
                             contents=contents,
                             config=generation_config
                         )
+                        req_ms = (time.perf_counter() - req_t0) * 1000.0
+
                         # Parse response into batch_images/response_text
+                        parse_t0 = time.perf_counter()
                         if hasattr(response, 'candidates') and response.candidates:
                             for candidate in response.candidates:
                                 if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
@@ -398,31 +445,37 @@ class ComfyUI_NanoBanana:
                                                 if isinstance(image_binary, (bytes, bytearray)) and len(image_binary) > 0:
                                                     batch_images.append({"data": bytes(image_binary), "mime": mime})
                                             except Exception as img_error:
-                                                operation_log += f"Error extracting image: {str(img_error)}\n"
+                                                emit(f"Error extracting image: {str(img_error)}")
+                        parse_ms = (time.perf_counter() - parse_t0) * 1000.0
+
+                        if debug_logging:
+                            emit(f"Batch {i+1} attempt {attempt}: request {req_ms:.1f} ms, parse {parse_ms:.1f} ms, images={len(batch_images)}, text_len={len(response_text)}")
                         # success -> break retry loop
                         break
                     except Exception as e:
                         last_error = e
+                        dur_ms = (time.perf_counter() - req_t0) * 1000.0 if 'req_t0' in locals() else 0.0
                         if attempt < retries:
-                            operation_log += f"Batch {i+1} attempt {attempt} failed: {e}; retrying...\n"
+                            emit(f"Batch {i+1} attempt {attempt} failed ({dur_ms:.1f} ms): {e}; retrying...")
                             time.sleep(min(2.0, 0.5 * attempt))
                         else:
-                            operation_log += f"Batch {i+1} failed after {retries} attempts: {e}\n"
+                            emit(f"Batch {i+1} failed after {retries} attempts ({dur_ms:.1f} ms): {e}")
 
                 if batch_images:
                     all_generated_images.extend(batch_images)
-                    operation_log += f"Batch {i+1}: Generated {len(batch_images)} images\n"
+                    emit(f"Batch {i+1}: Generated {len(batch_images)} images")
                 else:
                     # if we had response_text (e.g., safety or text-only) log a snippet
                     snippet = (response_text[:100] + "...") if response_text else ""
                     if last_error is not None and not response_text:
-                        operation_log += f"Batch {i+1}: No images. Last error: {last_error}\n"
+                        emit(f"Batch {i+1}: No images. Last error: {last_error}")
                     else:
-                        operation_log += f"Batch {i+1}: No images found. Text: {snippet}\n"
+                        emit(f"Batch {i+1}: No images found. Text: {snippet}")
 
             generated_tensors = []
+            decode_total_t0 = time.perf_counter()
             if all_generated_images:
-                for item in all_generated_images:
+                for idx, item in enumerate(all_generated_images, 1):
                     try:
                         # item may be dict with data/mime or raw bytes (legacy)
                         if isinstance(item, dict):
@@ -433,14 +486,24 @@ class ComfyUI_NanoBanana:
                             mime = "application/octet-stream"
 
                         # Use robust decoder
+                        dec_t0 = time.perf_counter()
                         img_np = _decode_image_to_numpy(img_bytes, mime_hint=mime)
+                        dec_ms = (time.perf_counter() - dec_t0) * 1000.0
+
+                        h, w = (img_np.shape[0], img_np.shape[1]) if img_np.ndim >= 2 else (0, 0)
+                        if debug_logging:
+                            emit(f"Decode image {idx}: {mime}, bytes={_safe_len(img_bytes)} -> {w}x{h}, {_fmt_ms(dec_ms/1000.0)}")
 
                         img_tensor = torch.from_numpy(img_np)[None,]
                         generated_tensors.append(img_tensor)
                     except Exception as e:
                         # Log a short hex prefix for debugging
                         hex_head = img_bytes[:12].hex() if isinstance(img_bytes, (bytes, bytearray)) else "n/a"
-                        operation_log += f"Error processing image: {e} head={hex_head}\n"
+                        emit(f"Error processing image: {e} head={hex_head}")
+
+            if debug_logging:
+                emit(f"Decode all images: {_fmt_ms(time.perf_counter() - decode_total_t0)}")
+                emit(f"Total (call_nano_banana_api): {_fmt_ms(time.perf_counter() - overall_t0)}")
 
             # NEW: if nothing generated, raise instead of returning empty
             if not generated_tensors:
@@ -458,12 +521,30 @@ class ComfyUI_NanoBanana:
     def nano_banana_generate(self, prompt, operation, reference_image_1=None, reference_image_2=None, 
                            reference_image_3=None, reference_image_4=None, reference_image_5=None, api_key="", 
                            batch_count=1, temperature=0.7, quality="high", aspect_ratio="1:1",
-                           character_consistency=True, enable_safety=True, seed=-1, retries=3):
-        
+                           character_consistency=True, enable_safety=True, seed=-1, retries=3, debug_logging=True):
+        outer_t0 = time.perf_counter()
+        stage_marks = []
+        def _mark(label, tstore=[time.perf_counter()]):
+            now = time.perf_counter()
+            stage_marks.append((label, now - tstore[0]))
+            tstore[0] = now
+
+        # NEW: immediate logger
+        operation_log = ""
+        def emit(msg):
+            nonlocal operation_log
+            operation_log += msg if msg.endswith("\n") else (msg + "\n")
+            if debug_logging:
+                try:
+                    print(msg, end="" if msg.endswith("\n") else "\n", flush=True)
+                except Exception:
+                    pass
+
         # Validate and set API key
         if api_key.strip():
             self.api_key = api_key
             save_config({"GEMINI_API_KEY": self.api_key})
+        _mark("API key validation")
 
         if not self.api_key:
             error_msg = "NANO BANANA ERROR: No API key provided!\n\n"
@@ -484,17 +565,27 @@ class ComfyUI_NanoBanana:
                         torch.cuda.manual_seed_all(norm_seed)
                 except Exception:
                     pass
+            _mark("Seed normalization/setup")
 
             # Process reference images (up to 5)
+            ref_shapes = []
+            for idx, ref in enumerate([reference_image_1, reference_image_2, reference_image_3, reference_image_4, reference_image_5], 1):
+                if isinstance(ref, torch.Tensor):
+                    # Accept (B,H,W,C) or (H,W,C)
+                    shape = tuple(ref.shape)
+                    ref_shapes.append((idx, shape))
             encoded_images = self.prepare_images_for_api(
                 reference_image_1, reference_image_2, reference_image_3, reference_image_4, reference_image_5
             )
+            enc_bytes = sum(_safe_len(e.get("inline_data", {}).get("data", b"")) for e in encoded_images)
             has_references = len(encoded_images) > 0
-            
+            _mark("Encode reference images")
+
             # Build optimized prompt
             final_prompt = self.build_prompt_for_operation(
                 prompt, operation, has_references, aspect_ratio, character_consistency
             )
+            _mark("Build prompt")
             
             if "Error:" in final_prompt:
                 return (self.create_placeholder_image(), final_prompt)
@@ -502,45 +593,90 @@ class ComfyUI_NanoBanana:
             # Add quality instructions
             if quality == "high":
                 final_prompt += " Use the highest quality settings available."
-            
-            # Log operation start
-            operation_log = f"NANO BANANA OPERATION LOG\n"
-            operation_log += f"Operation: {operation.upper()}\n"
-            operation_log += f"Reference Images: {len(encoded_images)}\n"
-            operation_log += f"Batch Count: {batch_count}\n"
-            operation_log += f"Temperature: {temperature}\n"
-            operation_log += f"Seed: {req_seed if (req_seed is not None) else 'auto'}\n"
+            _mark("Attach quality")
+
+            # Log operation start (print header immediately)
+            emit("NANO BANANA OPERATION LOG")
+            # NEW: Env and hardware info
+            if debug_logging:
+                try:
+                    cuda = torch.cuda.is_available()
+                    gpu_name = torch.cuda.get_device_name(0) if cuda else "CPU"
+                    vram_total = torch.cuda.get_device_properties(0).total_memory / (1024**3) if cuda else 0
+                    vram_reserved = torch.cuda.memory_reserved(0) / (1024**3) if cuda else 0
+                    vram_alloc = torch.cuda.memory_allocated(0) / (1024**3) if cuda else 0
+                except Exception:
+                    cuda, gpu_name, vram_total, vram_reserved, vram_alloc = False, "Unknown", 0, 0, 0
+                emit("DEBUG ENV:")
+                emit(f"- CPU cores: {os.cpu_count()}")
+                emit(f"- Torch: {torch.__version__}")
+                emit(f"- CUDA available: {cuda}, Device: {gpu_name}, VRAM total≈{vram_total:.2f} GB, reserved≈{vram_reserved:.2f} GB, alloc≈{vram_alloc:.2f} GB")
+                if ref_shapes:
+                    emit(f"- Reference tensor shapes: {ref_shapes}")
+
+            emit(f"Operation: {operation.upper()}")
+            emit(f"Reference Images: {len(encoded_images)} (payload≈{enc_bytes/1024:.1f} KB)")
+            emit(f"Batch Count: {batch_count}")
+            emit(f"Temperature: {temperature}")
+            emit(f"Seed: {req_seed if (req_seed is not None) else 'auto'}")
             if req_seed is not None and req_seed != norm_seed:
-                operation_log += f"Normalized seed (32-bit): {norm_seed}\n"
-            operation_log += f"Retries: {int(max(1, retries))}\n"  # NEW
-            operation_log += f"Quality: {quality}\n"
-            operation_log += f"Aspect Ratio: {aspect_ratio}\n"
-            operation_log += f"Character Consistency: {character_consistency}\n"
-            operation_log += f"Safety Filters: {enable_safety}\n"
-            operation_log += f"Note: Output resolution determined by API (max ~1024px)\n"
-            operation_log += f"Prompt: {final_prompt[:150]}...\n\n"
-            
+                emit(f"Normalized seed (32-bit): {norm_seed}")
+            emit(f"Retries: {int(max(1, retries))}")
+            emit(f"Quality: {quality}")
+            emit(f"Aspect Ratio: {aspect_ratio}")
+            emit(f"Character Consistency: {character_consistency}")
+            emit(f"Safety Filters: {enable_safety}")
+            emit("Note: Output resolution determined by API (max ~1024px)")
+            emit(f"Prompt (len={len(final_prompt)}): {final_prompt[:150]}...\n")
+
+            # Pre-API debug timings (outer setup)
+            if debug_logging and stage_marks:
+                emit("DEBUG TIMINGS (outer pre-API):")
+                for i, (label, secs) in enumerate(stage_marks, 1):
+                    emit(f"{i:02d}. {label}: {_fmt_ms(secs)}")
+                emit("")
+            stage_marks.clear()
+
             # Make API call with normalized seed and retries
+            api_t0 = time.perf_counter()
             generated_images, api_log = self.call_nano_banana_api(
                 final_prompt, encoded_images, temperature, batch_count, enable_safety,
-                seed=norm_seed, retries=int(max(1, retries))
+                seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging
             )
-            
+            api_secs = time.perf_counter() - api_t0
+            # api_log already printed via emit inside call; still append the returned log
             operation_log += api_log
-            
+            _mark("API call")
+
             # Process results
+            post_t0 = time.perf_counter()
             if generated_images:
                 # Combine all generated images into a batch tensor
                 combined_tensor = torch.cat(generated_images, dim=0)
-                
+                post_secs = time.perf_counter() - post_t0
+                _mark("Concat tensors")
+
                 # Calculate approximate cost
                 approx_cost = len(generated_images) * 0.039  # ~$0.039 per image
-                operation_log += f"\nEstimated cost: ~${approx_cost:.3f}\n"
-                operation_log += f"Successfully generated {len(generated_images)} image(s)!"
-                
+                emit(f"\nEstimated cost: ~${approx_cost:.3f}")
+                emit(f"Successfully generated {len(generated_images)} image(s)!")
+
+                # Tail debug timings (outer, incl. API call & concat)
+                if debug_logging and stage_marks:
+                    emit("DEBUG TIMINGS (outer post-API):")
+                    for i, (label, secs) in enumerate(stage_marks, 1):
+                        emit(f"{i:02d}. {label}: {_fmt_ms(secs)}")
+                    emit(f"Total (outer wrapper): {_fmt_ms((time.perf_counter() - outer_t0))}")
                 return (combined_tensor, operation_log)
             else:
-                operation_log += "\nNo images were generated. Check the log above for details."
+                post_secs = time.perf_counter() - post_t0
+                _mark("Post-process (no images)")
+                emit("\nNo images were generated. Check the log above for details.")
+                if debug_logging and stage_marks:
+                    emit("DEBUG TIMINGS (outer post-API):")
+                    for i, (label, secs) in enumerate(stage_marks, 1):
+                        emit(f"{i:02d}. {label}: {_fmt_ms(secs)}")
+                    emit(f"Total (outer wrapper): {_fmt_ms((time.perf_counter() - outer_t0))}")
                 return (self.create_placeholder_image(), operation_log)
                 
         except Exception:
