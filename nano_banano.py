@@ -9,6 +9,7 @@ import numpy as np
 import cv2  # NEW: for robust image decoding (WebP, etc.)
 import random  # NEW: optional local seeding
 import time  # NEW: for retry backoff
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout  # NEW: request timeout
 
 p = os.path.dirname(os.path.realpath(__file__))
 
@@ -200,6 +201,14 @@ class ComfyUI_NanoBanana:
                     "default": True,
                     "tooltip": "Print detailed timing and payload info for bottleneck analysis"
                 }),
+                # NEW: per-attempt request timeout (seconds)
+                "request_timeout": ("FLOAT", {
+                    "default": 60.0,
+                    "min": 5.0,
+                    "max": 600.0,
+                    "step": 5.0,
+                    "tooltip": "Per-attempt API request timeout seconds (timeout -> retry)."
+                }),
             }
         }
 
@@ -327,8 +336,9 @@ class ComfyUI_NanoBanana:
         norm = s % (max32 + 1)  # -> [0, 2147483647]
         return s, norm
 
-    # NEW: add debug_logging parameter to control detailed logs
-    def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety, seed=None, retries=3, debug_logging=False):
+    # NEW: add request_timeout param
+    def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety,
+                             seed=None, retries=3, debug_logging=False, request_timeout=60.0):
         """Make API call to Gemini 2.5 Flash Image using the working v6 approach with retries per batch"""
         overall_t0 = time.perf_counter()
         pre_debug_lines = []
@@ -416,15 +426,26 @@ class ComfyUI_NanoBanana:
                 response_text = ""
                 last_error = None
                 for attempt in range(1, int(max(1, retries)) + 1):
+                    timeout_hit = False
                     try:
                         req_t0 = time.perf_counter()
-                        response = client.models.generate_content(
-                            model="gemini-2.5-flash-image-preview",
-                            contents=contents,
-                            config=generation_config
-                        )
+                        # NEW: run SDK call in a worker thread to enforce timeout
+                        def _do_request():
+                            return client.models.generate_content(
+                                model="gemini-2.5-flash-image-preview",
+                                contents=contents,
+                                config=generation_config
+                            )
+                        with ThreadPoolExecutor(max_workers=1) as ex:
+                            future = ex.submit(_do_request)
+                            try:
+                                response = future.result(timeout=request_timeout)
+                            except _FuturesTimeout:
+                                timeout_hit = True
+                                # best-effort cancel
+                                future.cancel()
+                                raise RuntimeError(f"Request timed out after {request_timeout:.1f}s")
                         req_ms = (time.perf_counter() - req_t0) * 1000.0
-
                         # Parse response into batch_images/response_text
                         parse_t0 = time.perf_counter()
                         if hasattr(response, 'candidates') and response.candidates:
@@ -455,11 +476,12 @@ class ComfyUI_NanoBanana:
                     except Exception as e:
                         last_error = e
                         dur_ms = (time.perf_counter() - req_t0) * 1000.0 if 'req_t0' in locals() else 0.0
+                        kind = "timeout" if timeout_hit else "error"
                         if attempt < retries:
-                            emit(f"Batch {i+1} attempt {attempt} failed ({dur_ms:.1f} ms): {e}; retrying...")
+                            emit(f"Batch {i+1} attempt {attempt} {kind} ({dur_ms:.1f} ms): {e}; retrying...")
                             time.sleep(min(2.0, 0.5 * attempt))
                         else:
-                            emit(f"Batch {i+1} failed after {retries} attempts ({dur_ms:.1f} ms): {e}")
+                            emit(f"Batch {i+1} {kind} final fail after {retries} attempts ({dur_ms:.1f} ms): {e}")
 
                 if batch_images:
                     all_generated_images.extend(batch_images)
@@ -521,7 +543,7 @@ class ComfyUI_NanoBanana:
     def nano_banana_generate(self, prompt, operation, reference_image_1=None, reference_image_2=None, 
                            reference_image_3=None, reference_image_4=None, reference_image_5=None, api_key="", 
                            batch_count=1, temperature=0.7, quality="high", aspect_ratio="1:1",
-                           character_consistency=True, enable_safety=True, seed=-1, retries=3, debug_logging=True):
+                           character_consistency=True, enable_safety=True, seed=-1, retries=3, debug_logging=True, request_timeout=60.0):
         outer_t0 = time.perf_counter()
         stage_marks = []
         def _mark(label, tstore=[time.perf_counter()]):
@@ -626,6 +648,7 @@ class ComfyUI_NanoBanana:
             emit(f"Aspect Ratio: {aspect_ratio}")
             emit(f"Character Consistency: {character_consistency}")
             emit(f"Safety Filters: {enable_safety}")
+            emit(f"Request Timeout (per attempt): {request_timeout:.1f}s")
             emit("Note: Output resolution determined by API (max ~1024px)")
             emit(f"Prompt (len={len(final_prompt)}): {final_prompt[:150]}...\n")
 
@@ -641,7 +664,8 @@ class ComfyUI_NanoBanana:
             api_t0 = time.perf_counter()
             generated_images, api_log = self.call_nano_banana_api(
                 final_prompt, encoded_images, temperature, batch_count, enable_safety,
-                seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging
+                seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging,
+                request_timeout=request_timeout
             )
             api_secs = time.perf_counter() - api_t0
             # api_log already printed via emit inside call; still append the returned log
