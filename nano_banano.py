@@ -126,11 +126,7 @@ class ComfyUI_NanoBanana:
                 "prompt": ("STRING", {
                     "default": "Generate a high-quality, photorealistic image", 
                     "multiline": True,
-                    "tooltip": "Describe what you want to generate or edit"
-                }),
-                "operation": (["generate", "edit", "style_transfer", "object_insertion"], {
-                    "default": "generate",
-                    "tooltip": "Choose the type of image operation"
+                    "tooltip": "Describe what you want to generate."
                 }),
             },
             "optional": {
@@ -296,46 +292,20 @@ class ComfyUI_NanoBanana:
             }
         }
 
-    def build_prompt_for_operation(self, prompt, operation, has_references=False, aspect_ratio="1:1", character_consistency=True):
-        """Build optimized prompt based on operation type"""
-        
-        aspect_instructions = {
+    def build_prompt(self, prompt, has_references=False, aspect_ratio="1:1", character_consistency=True):
+        aspect_map = {
             "1:1": "square format",
             "16:9": "widescreen landscape format",
             "9:16": "portrait format",
-            "4:3": "standard landscape format", 
+            "4:3": "standard landscape format",
             "3:4": "standard portrait format"
         }
-        
-        base_quality = "Generate a high-quality, photorealistic image"
-        format_instruction = f"in {aspect_instructions.get(aspect_ratio, 'square format')}"
-        
-        if operation == "generate":
-            if has_references:
-                final_prompt = f"{base_quality} inspired by the style and elements of the reference images. {prompt}. {format_instruction}."
-            else:
-                final_prompt = f"{base_quality} of: {prompt}. {format_instruction}."
-                
-        elif operation == "edit":
-            if not has_references:
-                return "Error: Edit operation requires reference images"
-            # No aspect ratio for edit - preserve original image dimensions
-            final_prompt = f"Edit the provided reference image(s). {prompt}. Maintain the original composition and quality while making the requested changes."
-            
-        elif operation == "style_transfer":
-            if not has_references:
-                return "Error: Style transfer requires reference images"
-            final_prompt = f"Apply the style from the reference images to create: {prompt}. Blend the stylistic elements naturally. {format_instruction}."
-            
-        elif operation == "object_insertion":
-            if not has_references:
-                return "Error: Object insertion requires reference images"
-            final_prompt = f"Insert or blend the following into the reference image(s): {prompt}. Ensure natural lighting, shadows, and perspective. {format_instruction}."
-        
-        if character_consistency and has_references:
-            final_prompt += " Maintain character consistency and visual identity from the reference images."
-            
-        return final_prompt
+        parts = [prompt.strip()]
+        if aspect_ratio in aspect_map:
+            parts.append(f"(Use {aspect_map[aspect_ratio]})")
+        if has_references and character_consistency:
+            parts.append("Maintain visual/character consistency with the reference image(s).")
+        return " ".join(parts).strip()
 
     def _normalize_seed(self, seed):
         """Normalize any large seed into 32-bit non-negative range"""
@@ -596,10 +566,11 @@ class ComfyUI_NanoBanana:
             # NEW: bubble up other errors
             raise RuntimeError(f"Error in v6 method: {str(e)}") from e
 
-    def nano_banana_generate(self, prompt, operation, reference_image_1=None, reference_image_2=None, 
-                           reference_image_3=None, reference_image_4=None, reference_image_5=None, api_key="", 
-                           batch_count=1, temperature=0.7, quality="high", aspect_ratio="1:1",
-                           character_consistency=True, enable_safety=True, seed=-1, retries=3, debug_logging=True, request_timeout=60.0, timeout_strategy="poll", hard_overall_timeout=0.0):
+    def nano_banana_generate(self, prompt,  # operation removed
+                             reference_image_1=None, reference_image_2=None, 
+                             reference_image_3=None, reference_image_4=None, reference_image_5=None, api_key="", 
+                             batch_count=1, temperature=0.7, quality="high", aspect_ratio="1:1",
+                             character_consistency=True, enable_safety=True, seed=-1, retries=3, debug_logging=True, request_timeout=60.0, timeout_strategy="poll", hard_overall_timeout=0.0):
         outer_t0 = time.perf_counter()
         stage_marks = []
         def _mark(label, tstore=[time.perf_counter()]):
@@ -659,9 +630,9 @@ class ComfyUI_NanoBanana:
             has_references = len(encoded_images) > 0
             _mark("Encode reference images")
 
-            # Build optimized prompt
-            final_prompt = self.build_prompt_for_operation(
-                prompt, operation, has_references, aspect_ratio, character_consistency
+            # Build prompt (was build_prompt_for_operation)
+            final_prompt = self.build_prompt(
+                prompt, has_references, aspect_ratio, character_consistency
             )
             _mark("Build prompt")
             
@@ -692,7 +663,6 @@ class ComfyUI_NanoBanana:
                 if ref_shapes:
                     emit(f"- Reference tensor shapes: {ref_shapes}")
 
-            emit(f"Operation: {operation.upper()}")
             emit(f"Reference Images: {len(encoded_images)} (payload≈{enc_bytes/1024:.1f} KB)")
             emit(f"Batch Count: {batch_count}")
             emit(f"Temperature: {temperature}")
