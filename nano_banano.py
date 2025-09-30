@@ -264,20 +264,24 @@ class ComfyUI_NanoBanana:
         return torch.from_numpy(image_array).unsqueeze(0)
 
     def prepare_images_for_api(self, img1=None, img2=None, img3=None, img4=None, img5=None):
-        """Convert up to 5 tensor images to raw PNG bytes for API (resized ≤2048px)"""
-        encoded_images = []
-        for i, img in enumerate([img1, img2, img3, img4, img5], 1):
+        """Return (list_of_PIL_images, total_png_payload_bytes_estimate) per new SDK usage."""
+        pil_images = []
+        total_bytes = 0
+        for img in [img1, img2, img3, img4, img5]:
             if img is None:
                 continue
             if isinstance(img, torch.Tensor):
-                if len(img.shape) == 4:
+                if img.ndim == 4:
                     pil_image = self.tensor_to_image(img[0])
                 else:
                     pil_image = self.tensor_to_image(img)
-                # Resize to keep payload/API happy
                 pil_image = self.resize_image(pil_image, max_size=2048)
-                encoded_images.append(self._image_to_base64(pil_image))
-        return encoded_images
+                # size estimate (encode to PNG once for logging only)
+                buf = BytesIO()
+                pil_image.save(buf, format="PNG")
+                total_bytes += len(buf.getvalue())
+                pil_images.append(pil_image)
+        return pil_images, total_bytes
 
     def _image_to_base64(self, pil_image):
         """Convert PIL image to raw PNG bytes payload expected by SDK"""
@@ -320,7 +324,7 @@ class ComfyUI_NanoBanana:
         return s, norm
 
     # NEW: add request_timeout param
-    def call_nano_banana_api(self, prompt, encoded_images, temperature, batch_count, enable_safety,
+    def call_nano_banana_api(self, prompt, ref_pil_images, temperature, batch_count, enable_safety,
                              seed=None, retries=3, debug_logging=False, request_timeout=60.0,
                              timeout_strategy="poll", hard_overall_timeout=0.0):
         """Make API call to Gemini 2.5 Flash Image using the working v6 approach with retries per batch"""
@@ -363,34 +367,13 @@ class ComfyUI_NanoBanana:
                 )
             pre_debug_lines.append(f"Build generation config: {_fmt_ms(time.perf_counter() - cfg_t0)}")
 
-            # Build parts with text and image bytes
+            # NEW: Build contents using simple list [prompt, PIL.Image, PIL.Image, ...]
             parts_t0 = time.perf_counter()
-            parts = [types.Part(text=prompt)]
-            total_input_image_bytes = 0
-            for img_data in encoded_images:
-                # Be robust if data was accidentally base64-encoded
-                data_field = img_data.get("inline_data", {}).get("data", b"")
-                if isinstance(data_field, str):
-                    try:
-                        data_bytes = base64.b64decode(data_field)
-                    except Exception:
-                        continue
-                else:
-                    data_bytes = data_field
-                total_input_image_bytes += _safe_len(data_bytes)
-                mime = img_data.get("inline_data", {}).get("mime_type", "image/png")
-                parts.append(
-                    types.Part(
-                        inline_data=types.Blob(
-                            mime_type=mime,
-                            data=data_bytes
-                        )
-                    )
-                )
-            contents = [types.Content(role="user", parts=parts)]
+            contents = [prompt] + ref_pil_images
+            total_input_image_bytes = 0  # already estimated outside; keep 0 here
             pre_debug_lines.append(
-                f"Build parts: {_fmt_ms(time.perf_counter() - parts_t0)} "
-                f"(prompt_len={len(prompt)}, ref_images={len(encoded_images)}, payload≈{total_input_image_bytes/1024:.1f} KB)"
+                f"Build contents(list): {_fmt_ms(time.perf_counter() - parts_t0)} "
+                f"(prompt_len={len(prompt)}, ref_images={len(ref_pil_images)})"
             )
 
             if debug_logging and pre_debug_lines:
@@ -623,11 +606,10 @@ class ComfyUI_NanoBanana:
                     # Accept (B,H,W,C) or (H,W,C)
                     shape = tuple(ref.shape)
                     ref_shapes.append((idx, shape))
-            encoded_images = self.prepare_images_for_api(
+            ref_images, enc_bytes = self.prepare_images_for_api(
                 reference_image_1, reference_image_2, reference_image_3, reference_image_4, reference_image_5
             )
-            enc_bytes = sum(_safe_len(e.get("inline_data", {}).get("data", b"")) for e in encoded_images)
-            has_references = len(encoded_images) > 0
+            has_references = len(ref_images) > 0
             _mark("Encode reference images")
 
             # Build prompt (was build_prompt_for_operation)
@@ -663,7 +645,7 @@ class ComfyUI_NanoBanana:
                 if ref_shapes:
                     emit(f"- Reference tensor shapes: {ref_shapes}")
 
-            emit(f"Reference Images: {len(encoded_images)} (payload≈{enc_bytes/1024:.1f} KB)")
+            emit(f"Reference Images: {len(ref_images)} (payload≈{enc_bytes/1024:.1f} KB)")
             emit(f"Batch Count: {batch_count}")
             emit(f"Temperature: {temperature}")
             emit(f"Seed: {req_seed if (req_seed is not None) else 'auto'}")
@@ -692,7 +674,7 @@ class ComfyUI_NanoBanana:
             # Make API call with normalized seed and retries
             api_t0 = time.perf_counter()
             generated_images, api_log = self.call_nano_banana_api(
-                final_prompt, encoded_images, temperature, batch_count, enable_safety,
+                final_prompt, ref_images, temperature, batch_count, enable_safety,
                 seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging,
                 request_timeout=request_timeout, timeout_strategy=timeout_strategy,
                 hard_overall_timeout=hard_overall_timeout
