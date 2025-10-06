@@ -179,7 +179,7 @@ class ComfyUI_NanoBanana:
                     "default": "high",
                     "tooltip": "Image generation quality"
                 }),
-                "aspect_ratio": (["1:1", "16:9", "9:16", "4:3", "3:4"], {
+                "aspect_ratio": (["1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2", "4:5", "5:4", "21:9"], {
                     "default": "1:1",
                     "tooltip": "Output image aspect ratio"
                 }),
@@ -299,10 +299,15 @@ class ComfyUI_NanoBanana:
     def build_prompt(self, prompt, has_references=False, aspect_ratio="1:1", character_consistency=True):
         aspect_map = {
             "1:1": "square format",
-            "16:9": "widescreen landscape format",
-            "9:16": "portrait format",
+            "2:3": "tall portrait format",
+            "3:2": "wide landscape format",
+            "3:4": "standard portrait format",
             "4:3": "standard landscape format",
-            "3:4": "standard portrait format"
+            "4:5": "portrait format",
+            "5:4": "landscape format",
+            "9:16": "portrait format",
+            "16:9": "widescreen landscape format",
+            "21:9": "ultra-wide landscape format"
         }
         parts = [prompt.strip()]
         if aspect_ratio in aspect_map:
@@ -326,7 +331,7 @@ class ComfyUI_NanoBanana:
     # NEW: add request_timeout param
     def call_nano_banana_api(self, prompt, ref_pil_images, temperature, batch_count, enable_safety,
                              seed=None, retries=3, debug_logging=False, request_timeout=60.0,
-                             timeout_strategy="poll", hard_overall_timeout=0.0):
+                             timeout_strategy="poll", hard_overall_timeout=0.0, aspect_ratio="1:1"):
         """Make API call to Gemini 2.5 Flash Image using the working v6 approach with retries per batch"""
         overall_t0 = time.perf_counter()
         pre_debug_lines = []
@@ -349,30 +354,42 @@ class ComfyUI_NanoBanana:
             client = genai.Client(api_key=self.api_key)
             pre_debug_lines.append(f"SDK client init: {_fmt_ms(time.perf_counter() - sdk_t0)}")
 
-            # NEW: try to pass seed if supported by SDK/model
+            # NEW: try to pass seed and image_config (aspect ratio) if supported by SDK/model
             seed_applied = False
             cfg_t0 = time.perf_counter()
             try:
                 generation_config = types.GenerateContentConfig(
                     temperature=temperature,
                     response_modalities=['Text', 'Image'],
-                    seed=seed if (seed is not None and seed >= 0) else None
+                    seed=seed if (seed is not None and seed >= 0) else None,
+                    image_config=types.ImageConfig(aspect_ratio=str(aspect_ratio))
                 )
                 if seed is not None and seed >= 0:
                     seed_applied = True
             except TypeError:
-                generation_config = types.GenerateContentConfig(
-                    temperature=temperature,
-                    response_modalities=['Text', 'Image']
-                )
+                # Fallback for older SDKs without image_config or seed support in this class
+                try:
+                    generation_config = types.GenerateContentConfig(
+                        temperature=temperature,
+                        response_modalities=['Text', 'Image'],
+                        seed=seed if (seed is not None and seed >= 0) else None
+                    )
+                    if seed is not None and seed >= 0:
+                        seed_applied = True
+                except TypeError:
+                    generation_config = types.GenerateContentConfig(
+                        temperature=temperature,
+                        response_modalities=['Text', 'Image']
+                    )
             pre_debug_lines.append(f"Build generation config: {_fmt_ms(time.perf_counter() - cfg_t0)}")
 
-            # NEW: Build contents using simple list [prompt, PIL.Image, PIL.Image, ...]
+            # NEW: Build contents using required ordering: all images first, then text prompt last
             parts_t0 = time.perf_counter()
-            contents = [prompt] + ref_pil_images
-            total_input_image_bytes = 0  # already estimated outside; keep 0 here
+            # Previously: contents = [prompt] + ref_pil_images
+            contents = list(ref_pil_images) + [prompt]  # images first, text last
+            total_input_image_bytes = 0
             pre_debug_lines.append(
-                f"Build contents(list): {_fmt_ms(time.perf_counter() - parts_t0)} "
+                f"Build contents(list, imgs->text): {_fmt_ms(time.perf_counter() - parts_t0)} "
                 f"(prompt_len={len(prompt)}, ref_images={len(ref_pil_images)})"
             )
 
@@ -406,7 +423,7 @@ class ComfyUI_NanoBanana:
                     try:
                         def _do_request():
                             return client.models.generate_content(
-                                model="gemini-2.5-flash-image-preview",
+                                model="gemini-2.5-flash-image",
                                 contents=contents,
                                 config=generation_config
                             )
@@ -661,7 +678,7 @@ class ComfyUI_NanoBanana:
             if hard_overall_timeout > 0:
                 emit(f"Overall Hard Timeout: {hard_overall_timeout:.1f}s")
             emit("Note: Output resolution determined by API (max ~1024px)")
-            emit(f"Prompt (len={len(final_prompt)}): {final_prompt[:150]}...\n")
+            emit(f"Prompt placed last (len={len(final_prompt)}). Preview: {final_prompt[:150]}...\n")
 
             # Pre-API debug timings (outer setup)
             if debug_logging and stage_marks:
@@ -677,7 +694,7 @@ class ComfyUI_NanoBanana:
                 final_prompt, ref_images, temperature, batch_count, enable_safety,
                 seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging,
                 request_timeout=request_timeout, timeout_strategy=timeout_strategy,
-                hard_overall_timeout=hard_overall_timeout
+                hard_overall_timeout=hard_overall_timeout, aspect_ratio=aspect_ratio
             )
             api_secs = time.perf_counter() - api_t0
             # api_log already printed via emit inside call; still append the returned log
