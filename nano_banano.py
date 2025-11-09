@@ -218,6 +218,20 @@ class ComfyUI_NanoBanana:
                     "step": 10.0,
                     "tooltip": "Abort entire call_nano_banana_api after this many seconds (0=off)."
                 }),
+                "top_p": ("FLOAT", {
+                    "default": 0.95,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Probability threshold for nucleus (top-p) sampling"
+                }),
+                "max_output_tokens": ("INT", {
+                    "default": 8192,
+                    "min": 1,
+                    "max": 8192,
+                    "step": 64,
+                    "tooltip": "Maximum number of tokens in response. For image outputs, typically ~1290 tokens per image."
+                }),
             }
         }
 
@@ -329,7 +343,7 @@ class ComfyUI_NanoBanana:
         return s, norm
 
     # NEW: add request_timeout param
-    def call_nano_banana_api(self, prompt, ref_pil_images, temperature, batch_count, enable_safety,
+    def call_nano_banana_api(self, prompt, ref_pil_images, temperature, top_p, max_output_tokens, batch_count, enable_safety,
                              seed=None, retries=3, debug_logging=False, request_timeout=60.0,
                              timeout_strategy="poll", hard_overall_timeout=0.0, aspect_ratio="1:1"):
         """Make API call to Gemini 2.5 Flash Image using the working v6 approach with retries per batch"""
@@ -360,7 +374,9 @@ class ComfyUI_NanoBanana:
             try:
                 generation_config = types.GenerateContentConfig(
                     temperature=temperature,
-                    response_modalities=['Text', 'Image'],
+                    top_p=top_p,
+                    max_output_tokens=int(max_output_tokens) if (isinstance(max_output_tokens, (int, float)) and max_output_tokens > 0) else None,
+                    response_modalities=['Image'],
                     seed=seed if (seed is not None and seed >= 0) else None,
                     image_config=types.ImageConfig(aspect_ratio=str(aspect_ratio))
                 )
@@ -371,7 +387,9 @@ class ComfyUI_NanoBanana:
                 try:
                     generation_config = types.GenerateContentConfig(
                         temperature=temperature,
-                        response_modalities=['Text', 'Image'],
+                        top_p=top_p,
+                        max_output_tokens=int(max_output_tokens) if (isinstance(max_output_tokens, (int, float)) and max_output_tokens > 0) else None,
+                        response_modalities=['Image'],
                         seed=seed if (seed is not None and seed >= 0) else None
                     )
                     if seed is not None and seed >= 0:
@@ -379,7 +397,8 @@ class ComfyUI_NanoBanana:
                 except TypeError:
                     generation_config = types.GenerateContentConfig(
                         temperature=temperature,
-                        response_modalities=['Text', 'Image']
+                        top_p=top_p,
+                        response_modalities=['Image']
                     )
             pre_debug_lines.append(f"Build generation config: {_fmt_ms(time.perf_counter() - cfg_t0)}")
 
@@ -569,7 +588,7 @@ class ComfyUI_NanoBanana:
     def nano_banana_generate(self, prompt,  # operation removed
                              reference_image_1=None, reference_image_2=None, 
                              reference_image_3=None, reference_image_4=None, reference_image_5=None, api_key="", 
-                             batch_count=1, temperature=0.7, quality="high", aspect_ratio="1:1",
+                             batch_count=1, temperature=0.7, top_p=0.95, max_output_tokens=8192, quality="high", aspect_ratio="1:1",
                              character_consistency=True, enable_safety=True, seed=-1, retries=3, debug_logging=True, request_timeout=60.0, timeout_strategy="poll", hard_overall_timeout=0.0):
         outer_t0 = time.perf_counter()
         stage_marks = []
@@ -665,7 +684,9 @@ class ComfyUI_NanoBanana:
             emit(f"Reference Images: {len(ref_images)} (payload≈{enc_bytes/1024:.1f} KB)")
             emit(f"Batch Count: {batch_count}")
             emit(f"Temperature: {temperature}")
+            emit(f"Top-p (nucleus sampling): {top_p}")
             emit(f"Seed: {req_seed if (req_seed is not None) else 'auto'}")
+            emit(f"Max output tokens: {max_output_tokens}")
             if req_seed is not None and req_seed != norm_seed:
                 emit(f"Normalized seed (32-bit): {norm_seed}")
             emit(f"Retries: {int(max(1, retries))}")
@@ -691,7 +712,7 @@ class ComfyUI_NanoBanana:
             # Make API call with normalized seed and retries
             api_t0 = time.perf_counter()
             generated_images, api_log = self.call_nano_banana_api(
-                final_prompt, ref_images, temperature, batch_count, enable_safety,
+                final_prompt, ref_images, temperature, top_p, max_output_tokens, batch_count, enable_safety,
                 seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging,
                 request_timeout=request_timeout, timeout_strategy=timeout_strategy,
                 hard_overall_timeout=hard_overall_timeout, aspect_ratio=aspect_ratio
