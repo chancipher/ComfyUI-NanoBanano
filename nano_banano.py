@@ -130,25 +130,9 @@ class ComfyUI_NanoBanana:
                 }),
             },
             "optional": {
-                "reference_image_1": ("IMAGE", {
+                "reference_images": ("IMAGE", {
                     "forceInput": False,
-                    "tooltip": "Primary reference image for editing/style transfer"
-                }),
-                "reference_image_2": ("IMAGE", {
-                    "forceInput": False,
-                    "tooltip": "Second reference image (optional)"
-                }),
-                "reference_image_3": ("IMAGE", {
-                    "forceInput": False,
-                    "tooltip": "Third reference image (optional)"
-                }),
-                "reference_image_4": ("IMAGE", {
-                    "forceInput": False,
-                    "tooltip": "Fourth reference image (optional)"
-                }),
-                "reference_image_5": ("IMAGE", {
-                    "forceInput": False,
-                    "tooltip": "Fifth reference image (optional)"
+                    "tooltip": "Reference images for editing/style transfer (supports batch, max 3 images per API docs)"
                 }),
                 "api_key": ("STRING", {
                     "default": "",
@@ -187,17 +171,14 @@ class ComfyUI_NanoBanana:
                     "default": True,
                     "tooltip": "Maintain character consistency across edits"
                 }),
-
                 "enable_safety": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Enable content safety filters"
                 }),
-                # NEW: debug toggle
                 "debug_logging": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Print detailed timing and payload info for bottleneck analysis"
                 }),
-                # NEW: per-attempt request timeout (seconds)
                 "request_timeout": ("FLOAT", {
                     "default": 60.0,
                     "min": 5.0,
@@ -205,12 +186,10 @@ class ComfyUI_NanoBanana:
                     "step": 5.0,
                     "tooltip": "Per-attempt API request timeout seconds (timeout -> retry)."
                 }),
-                # NEW: timeout handling strategy
                 "timeout_strategy": (["poll", "future"], {
                     "default": "poll",
                     "tooltip": "poll: cooperative polling (non-blocking). future: use future.result(timeout=...)."
                 }),
-                # NEW: overall hard stop (seconds) for whole API call (0 = disabled)
                 "hard_overall_timeout": ("FLOAT", {
                     "default": 0.0,
                     "min": 0.0,
@@ -238,8 +217,8 @@ class ComfyUI_NanoBanana:
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("generated_images", "operation_log")
     FUNCTION = "nano_banana_generate"
-    CATEGORY = "Nano Banana (Gemini 2.5 Flash Image)"
-    DESCRIPTION = "Generate and edit images using Google's Nano Banana (Gemini 2.5 Flash Image) model. Requires paid API access."
+    CATEGORY = "Nano Banana"
+    DESCRIPTION = "Generate and edit images using Google's Gemini 2.5 Flash Image model. Fast generation, max 3 reference images. Requires paid API access."
 
     def tensor_to_image(self, tensor):
         """Convert tensor to PIL Image"""
@@ -277,24 +256,33 @@ class ComfyUI_NanoBanana:
         image_array = np.array(img).astype(np.float32) / 255.0
         return torch.from_numpy(image_array).unsqueeze(0)
 
-    def prepare_images_for_api(self, img1=None, img2=None, img3=None, img4=None, img5=None):
-        """Return (list_of_PIL_images, total_png_payload_bytes_estimate) per new SDK usage."""
+    def prepare_images_for_api(self, images=None):
+        """Return (list_of_PIL_images, total_png_payload_bytes_estimate) per new SDK usage.
+        
+        Accepts a batch tensor of shape (B, H, W, C) and processes all images in the batch.
+        """
         pil_images = []
         total_bytes = 0
-        for img in [img1, img2, img3, img4, img5]:
-            if img is None:
-                continue
-            if isinstance(img, torch.Tensor):
-                if img.ndim == 4:
-                    pil_image = self.tensor_to_image(img[0])
-                else:
-                    pil_image = self.tensor_to_image(img)
+        
+        if images is None:
+            return pil_images, total_bytes
+            
+        if isinstance(images, torch.Tensor):
+            # Ensure 4D tensor (B, H, W, C)
+            if images.ndim == 3:
+                images = images.unsqueeze(0)
+            
+            batch_size = images.shape[0]
+            for i in range(batch_size):
+                single_image = images[i]  # (H, W, C)
+                pil_image = self.tensor_to_image(single_image)
                 pil_image = self.resize_image(pil_image, max_size=2048)
                 # size estimate (encode to PNG once for logging only)
                 buf = BytesIO()
                 pil_image.save(buf, format="PNG")
                 total_bytes += len(buf.getvalue())
                 pil_images.append(pil_image)
+                
         return pil_images, total_bytes
 
     def _image_to_base64(self, pil_image):
@@ -345,8 +333,9 @@ class ComfyUI_NanoBanana:
     # NEW: add request_timeout param
     def call_nano_banana_api(self, prompt, ref_pil_images, temperature, top_p, max_output_tokens, batch_count, enable_safety,
                              seed=None, retries=3, debug_logging=False, request_timeout=60.0,
-                             timeout_strategy="poll", hard_overall_timeout=0.0, aspect_ratio="1:1"):
-        """Make API call to Gemini 2.5 Flash Image using the working v6 approach with retries per batch"""
+                             timeout_strategy="poll", hard_overall_timeout=0.0, aspect_ratio="1:1",
+                             model_name="gemini-2.5-flash-image", image_size="1K", enable_google_search=False):
+        """Make API call to Gemini image models with retries per batch"""
         overall_t0 = time.perf_counter()
         pre_debug_lines = []
         operation_log = ""  # moved before emit
@@ -368,22 +357,39 @@ class ComfyUI_NanoBanana:
             client = genai.Client(api_key=self.api_key)
             pre_debug_lines.append(f"SDK client init: {_fmt_ms(time.perf_counter() - sdk_t0)}")
 
-            # NEW: try to pass seed and image_config (aspect ratio) if supported by SDK/model
+            # Determine if using Pro model
+            is_pro_model = "gemini-3-pro" in model_name
+            
+            # NEW: try to pass seed and image_config (aspect ratio, image_size) if supported by SDK/model
             seed_applied = False
             cfg_t0 = time.perf_counter()
+            
+            # Build image_config based on model
+            image_config_kwargs = {"aspect_ratio": str(aspect_ratio)}
+            if is_pro_model and image_size:
+                image_config_kwargs["image_size"] = image_size
+            
+            # Build tools list for Pro model with Google Search
+            tools = None
+            if is_pro_model and enable_google_search:
+                tools = [{"google_search": {}}]
+            
             try:
-                generation_config = types.GenerateContentConfig(
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_output_tokens=int(max_output_tokens) if (isinstance(max_output_tokens, (int, float)) and max_output_tokens > 0) else None,
-                    response_modalities=['Image'],
-                    seed=seed if (seed is not None and seed >= 0) else None,
-                    image_config=types.ImageConfig(aspect_ratio=str(aspect_ratio))
-                )
+                config_kwargs = {
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "max_output_tokens": int(max_output_tokens) if (isinstance(max_output_tokens, (int, float)) and max_output_tokens > 0) else None,
+                    "response_modalities": ['Text', 'Image'] if is_pro_model else ['Image'],
+                    "seed": seed if (seed is not None and seed >= 0) else None,
+                    "image_config": types.ImageConfig(**image_config_kwargs)
+                }
+                if tools:
+                    config_kwargs["tools"] = tools
+                generation_config = types.GenerateContentConfig(**config_kwargs)
                 if seed is not None and seed >= 0:
                     seed_applied = True
             except TypeError:
-                # Fallback for older SDKs without image_config or seed support in this class
+                # Fallback for older SDKs without image_config or seed support
                 try:
                     generation_config = types.GenerateContentConfig(
                         temperature=temperature,
@@ -442,7 +448,7 @@ class ComfyUI_NanoBanana:
                     try:
                         def _do_request():
                             return client.models.generate_content(
-                                model="gemini-2.5-flash-image",
+                                model=model_name,
                                 contents=contents,
                                 config=generation_config
                             )
@@ -585,9 +591,8 @@ class ComfyUI_NanoBanana:
             # NEW: bubble up other errors
             raise RuntimeError(f"Error in v6 method: {str(e)}") from e
 
-    def nano_banana_generate(self, prompt,  # operation removed
-                             reference_image_1=None, reference_image_2=None, 
-                             reference_image_3=None, reference_image_4=None, reference_image_5=None, api_key="", 
+    def nano_banana_generate(self, prompt,
+                             reference_images=None, api_key="", 
                              batch_count=1, temperature=0.7, top_p=0.95, max_output_tokens=8192, quality="high", aspect_ratio="1:1",
                              character_consistency=True, enable_safety=True, seed=-1, retries=3, debug_logging=True, request_timeout=60.0, timeout_strategy="poll", hard_overall_timeout=0.0):
         outer_t0 = time.perf_counter()
@@ -596,6 +601,11 @@ class ComfyUI_NanoBanana:
             now = time.perf_counter()
             stage_marks.append((label, now - tstore[0]))
             tstore[0] = now
+
+        # Fixed model for this node
+        model_name = "gemini-2.5-flash-image"
+        model_display = "Nano Banana (Gemini 2.5 Flash Image)"
+        max_ref_images = 3
 
         # NEW: immediate logger
         operation_log = ""
@@ -616,7 +626,7 @@ class ComfyUI_NanoBanana:
 
         if not self.api_key:
             error_msg = "NANO BANANA ERROR: No API key provided!\n\n"
-            error_msg += "Gemini 2.5 Flash Image requires a PAID API key.\n"
+            error_msg += f"{model_display} requires a PAID API key.\n"
             error_msg += "Get yours at: https://aistudio.google.com/app/apikey\n"
             error_msg += "Note: Free tier users cannot access image generation models."
             return (self.create_placeholder_image(), error_msg)
@@ -635,16 +645,23 @@ class ComfyUI_NanoBanana:
                     pass
             _mark("Seed normalization/setup")
 
-            # Process reference images (up to 5)
+            # Process reference images (batch tensor)
             ref_shapes = []
-            for idx, ref in enumerate([reference_image_1, reference_image_2, reference_image_3, reference_image_4, reference_image_5], 1):
-                if isinstance(ref, torch.Tensor):
-                    # Accept (B,H,W,C) or (H,W,C)
-                    shape = tuple(ref.shape)
-                    ref_shapes.append((idx, shape))
-            ref_images, enc_bytes = self.prepare_images_for_api(
-                reference_image_1, reference_image_2, reference_image_3, reference_image_4, reference_image_5
-            )
+            if isinstance(reference_images, torch.Tensor):
+                # Ensure 4D tensor (B, H, W, C)
+                if reference_images.ndim == 3:
+                    reference_images = reference_images.unsqueeze(0)
+                batch_size = reference_images.shape[0]
+                
+                # Warn if too many reference images (Flash model limit: 3 per API docs)
+                if batch_size > max_ref_images:
+                    emit(f"WARNING: {batch_size} reference images provided, but {model_display} only accepts up to {max_ref_images} (API limit). Using first {max_ref_images}.")
+                    reference_images = reference_images[:max_ref_images]
+                    batch_size = max_ref_images
+                
+                for i in range(batch_size):
+                    ref_shapes.append((i + 1, tuple(reference_images[i].shape)))
+            ref_images, enc_bytes = self.prepare_images_for_api(reference_images)
             has_references = len(ref_images) > 0
             _mark("Encode reference images")
 
@@ -663,7 +680,7 @@ class ComfyUI_NanoBanana:
             _mark("Attach quality")
 
             # Log operation start (print header immediately)
-            emit("NANO BANANA OPERATION LOG")
+            emit(f"NANO BANANA OPERATION LOG - {model_display}")
             # NEW: Env and hardware info
             if debug_logging:
                 try:
@@ -681,7 +698,8 @@ class ComfyUI_NanoBanana:
                 if ref_shapes:
                     emit(f"- Reference tensor shapes: {ref_shapes}")
 
-            emit(f"Reference Images: {len(ref_images)} (payload≈{enc_bytes/1024:.1f} KB)")
+            emit(f"Model: {model_name}")
+            emit(f"Reference Images: {len(ref_images)} (payload≈{enc_bytes/1024:.1f} KB, max recommended: {max_ref_images})")
             emit(f"Batch Count: {batch_count}")
             emit(f"Temperature: {temperature}")
             emit(f"Top-p (nucleus sampling): {top_p}")
@@ -715,7 +733,8 @@ class ComfyUI_NanoBanana:
                 final_prompt, ref_images, temperature, top_p, max_output_tokens, batch_count, enable_safety,
                 seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging,
                 request_timeout=request_timeout, timeout_strategy=timeout_strategy,
-                hard_overall_timeout=hard_overall_timeout, aspect_ratio=aspect_ratio
+                hard_overall_timeout=hard_overall_timeout, aspect_ratio=aspect_ratio,
+                model_name=model_name
             )
             api_secs = time.perf_counter() - api_t0
             # api_log already printed via emit inside call; still append the returned log
@@ -763,5 +782,294 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ComfyUI_NanoBanana": "Nano Banana (Gemini 2.5 Flash Image)",
+    "ComfyUI_NanoBanana": "Nano Banana (Gemini 2.5 Flash)",
 }
+
+
+class ComfyUI_NanoBananaPro(ComfyUI_NanoBanana):
+    """Nano Banana Pro - Gemini 3 Pro Image Preview with advanced features"""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {
+                    "default": "Generate a high-quality, photorealistic image", 
+                    "multiline": True,
+                    "tooltip": "Describe what you want to generate."
+                }),
+            },
+            "optional": {
+                "reference_images": ("IMAGE", {
+                    "forceInput": False,
+                    "tooltip": "Reference images for editing/style transfer (supports batch, up to 14 images for Pro)"
+                }),
+                "api_key": ("STRING", {
+                    "default": "",
+                    "tooltip": "Your Gemini API key (paid tier required)"
+                }),
+                "batch_count": ("INT", {
+                    "default": 1, 
+                    "min": 1, 
+                    "max": 4, 
+                    "step": 1,
+                    "tooltip": "Number of images to generate (costs multiply)"
+                }),
+                "temperature": ("FLOAT", {
+                    "default": 0.7, 
+                    "min": 0.0, 
+                    "max": 1.0, 
+                    "step": 0.1,
+                    "tooltip": "Creativity level (0.0 = deterministic, 1.0 = very creative)"
+                }),
+                "seed": ("INT", {
+                    "default": -1,
+                    "min": -1,
+                    "max": 9007199254740991,
+                    "step": 1,
+                    "tooltip": "Random seed (-1 = auto)."
+                }),
+                "quality": (["standard", "high"], {
+                    "default": "high",
+                    "tooltip": "Image generation quality"
+                }),
+                "aspect_ratio": (["1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2", "4:5", "5:4", "21:9"], {
+                    "default": "1:1",
+                    "tooltip": "Output image aspect ratio"
+                }),
+                "image_size": (["1K", "2K", "4K"], {
+                    "default": "1K",
+                    "tooltip": "Output resolution. 1K=~1024px, 2K=~2048px, 4K=~4096px"
+                }),
+                "enable_google_search": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable Google Search grounding for real-time info (weather, news, etc.)"
+                }),
+                "character_consistency": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Maintain character consistency across edits"
+                }),
+                "enable_safety": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable content safety filters"
+                }),
+                "debug_logging": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Print detailed timing and payload info"
+                }),
+                "request_timeout": ("FLOAT", {
+                    "default": 120.0,
+                    "min": 10.0,
+                    "max": 600.0,
+                    "step": 10.0,
+                    "tooltip": "Per-attempt API request timeout seconds (Pro model may take longer)"
+                }),
+                "timeout_strategy": (["poll", "future"], {
+                    "default": "poll",
+                    "tooltip": "poll: cooperative polling. future: use future.result(timeout=...)."
+                }),
+                "hard_overall_timeout": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 3600.0,
+                    "step": 30.0,
+                    "tooltip": "Abort entire API call after this many seconds (0=off)."
+                }),
+                "top_p": ("FLOAT", {
+                    "default": 0.95,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Probability threshold for nucleus (top-p) sampling"
+                }),
+                "max_output_tokens": ("INT", {
+                    "default": 8192,
+                    "min": 1,
+                    "max": 8192,
+                    "step": 64,
+                    "tooltip": "Maximum number of tokens in response."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("generated_images", "operation_log")
+    FUNCTION = "nano_banana_pro_generate"
+    CATEGORY = "Nano Banana"
+    DESCRIPTION = "Generate and edit images using Google's Gemini 3 Pro Image Preview. Supports up to 14 reference images, 4K output, Google Search grounding, and Thinking mode. Requires paid API access."
+
+    def nano_banana_pro_generate(self, prompt,
+                                 reference_images=None, api_key="", 
+                                 batch_count=1, temperature=0.7, top_p=0.95, max_output_tokens=8192, 
+                                 quality="high", aspect_ratio="1:1", image_size="1K", enable_google_search=False,
+                                 character_consistency=True, enable_safety=True, seed=-1, retries=3, 
+                                 debug_logging=True, request_timeout=120.0, timeout_strategy="poll", hard_overall_timeout=0.0):
+        outer_t0 = time.perf_counter()
+        stage_marks = []
+        def _mark(label, tstore=[time.perf_counter()]):
+            now = time.perf_counter()
+            stage_marks.append((label, now - tstore[0]))
+            tstore[0] = now
+
+        # Fixed model for Pro node
+        model_name = "gemini-3-pro-image-preview"
+        model_display = "Nano Banana Pro (Gemini 3 Pro Image Preview)"
+        max_ref_images = 14
+
+        # immediate logger
+        operation_log = ""
+        def emit(msg):
+            nonlocal operation_log
+            operation_log += msg if msg.endswith("\n") else (msg + "\n")
+            if debug_logging:
+                try:
+                    print(msg, end="" if msg.endswith("\n") else "\n", flush=True)
+                except Exception:
+                    pass
+
+        # Validate and set API key
+        if api_key.strip():
+            self.api_key = api_key
+            save_config({"GEMINI_API_KEY": self.api_key})
+        _mark("API key validation")
+
+        if not self.api_key:
+            error_msg = "NANO BANANA PRO ERROR: No API key provided!\n\n"
+            error_msg += f"{model_display} requires a PAID API key.\n"
+            error_msg += "Get yours at: https://aistudio.google.com/app/apikey\n"
+            error_msg += "Note: Free tier users cannot access image generation models."
+            return (self.create_placeholder_image(), error_msg)
+
+        try:
+            # Normalize seed
+            req_seed, norm_seed = self._normalize_seed(seed)
+            if norm_seed is not None:
+                try:
+                    random.seed(norm_seed)
+                    np.random.seed(norm_seed)
+                    torch.manual_seed(norm_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(norm_seed)
+                except Exception:
+                    pass
+            _mark("Seed normalization/setup")
+
+            # Process reference images (batch tensor)
+            ref_shapes = []
+            if isinstance(reference_images, torch.Tensor):
+                if reference_images.ndim == 3:
+                    reference_images = reference_images.unsqueeze(0)
+                batch_size = reference_images.shape[0]
+                
+                # Warn if too many reference images
+                if batch_size > max_ref_images:
+                    emit(f"WARNING: {batch_size} reference images provided, but Pro model supports up to {max_ref_images}. Using first {max_ref_images}.")
+                    reference_images = reference_images[:max_ref_images]
+                    batch_size = max_ref_images
+                
+                for i in range(batch_size):
+                    ref_shapes.append((i + 1, tuple(reference_images[i].shape)))
+            ref_images, enc_bytes = self.prepare_images_for_api(reference_images)
+            has_references = len(ref_images) > 0
+            _mark("Encode reference images")
+
+            # Build prompt
+            final_prompt = self.build_prompt(
+                prompt, has_references, aspect_ratio, character_consistency
+            )
+            _mark("Build prompt")
+            
+            if "Error:" in final_prompt:
+                return (self.create_placeholder_image(), final_prompt)
+            
+            if quality == "high":
+                final_prompt += " Use the highest quality settings available."
+            _mark("Attach quality")
+
+            # Log operation start
+            emit(f"NANO BANANA PRO OPERATION LOG - {model_display}")
+            if debug_logging:
+                try:
+                    cuda = torch.cuda.is_available()
+                    gpu_name = torch.cuda.get_device_name(0) if cuda else "CPU"
+                    vram_total = torch.cuda.get_device_properties(0).total_memory / (1024**3) if cuda else 0
+                    vram_reserved = torch.cuda.memory_reserved(0) / (1024**3) if cuda else 0
+                    vram_alloc = torch.cuda.memory_allocated(0) / (1024**3) if cuda else 0
+                except Exception:
+                    cuda, gpu_name, vram_total, vram_reserved, vram_alloc = False, "Unknown", 0, 0, 0
+                emit("DEBUG ENV:")
+                emit(f"- CPU cores: {os.cpu_count()}")
+                emit(f"- Torch: {torch.__version__}")
+                emit(f"- CUDA available: {cuda}, Device: {gpu_name}, VRAM total≈{vram_total:.2f} GB")
+                if ref_shapes:
+                    emit(f"- Reference tensor shapes: {ref_shapes}")
+
+            emit(f"Model: {model_name}")
+            emit(f"Reference Images: {len(ref_images)} (payload≈{enc_bytes/1024:.1f} KB, max: {max_ref_images})")
+            emit(f"Batch Count: {batch_count}")
+            emit(f"Temperature: {temperature}")
+            emit(f"Top-p: {top_p}")
+            emit(f"Seed: {req_seed if (req_seed is not None) else 'auto'}")
+            if req_seed is not None and req_seed != norm_seed:
+                emit(f"Normalized seed (32-bit): {norm_seed}")
+            emit(f"Quality: {quality}")
+            emit(f"Aspect Ratio: {aspect_ratio}")
+            emit(f"Image Size: {image_size}")
+            emit(f"Google Search Grounding: {enable_google_search}")
+            emit(f"Character Consistency: {character_consistency}")
+            emit(f"Request Timeout: {request_timeout:.1f}s")
+            if hard_overall_timeout > 0:
+                emit(f"Overall Hard Timeout: {hard_overall_timeout:.1f}s")
+            emit("Note: Pro model uses Thinking mode for complex prompts and supports up to 4K output")
+            emit(f"Prompt preview: {final_prompt[:150]}...\n")
+
+            # Pre-API debug timings
+            if debug_logging and stage_marks:
+                emit("DEBUG TIMINGS (pre-API):")
+                for i, (label, secs) in enumerate(stage_marks, 1):
+                    emit(f"{i:02d}. {label}: {_fmt_ms(secs)}")
+                emit("")
+            stage_marks.clear()
+
+            # Make API call
+            api_t0 = time.perf_counter()
+            generated_images, api_log = self.call_nano_banana_api(
+                final_prompt, ref_images, temperature, top_p, max_output_tokens, batch_count, enable_safety,
+                seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging,
+                request_timeout=request_timeout, timeout_strategy=timeout_strategy,
+                hard_overall_timeout=hard_overall_timeout, aspect_ratio=aspect_ratio,
+                model_name=model_name, image_size=image_size, enable_google_search=enable_google_search
+            )
+            api_secs = time.perf_counter() - api_t0
+            operation_log += api_log
+            _mark("API call")
+
+            # Process results
+            post_t0 = time.perf_counter()
+            if generated_images:
+                combined_tensor = torch.cat(generated_images, dim=0)
+                post_secs = time.perf_counter() - post_t0
+                _mark("Concat tensors")
+
+                # Cost estimate (Pro is more expensive)
+                approx_cost = len(generated_images) * 0.08  # ~$0.08 per image for Pro
+                emit(f"\nEstimated cost: ~${approx_cost:.3f}")
+                emit(f"Successfully generated {len(generated_images)} image(s)!")
+
+                if debug_logging and stage_marks:
+                    emit("DEBUG TIMINGS (post-API):")
+                    for i, (label, secs) in enumerate(stage_marks, 1):
+                        emit(f"{i:02d}. {label}: {_fmt_ms(secs)}")
+                    emit(f"Total: {_fmt_ms((time.perf_counter() - outer_t0))}")
+                return (combined_tensor, operation_log)
+            else:
+                emit("\nNo images were generated. Check the log above for details.")
+                return (self.create_placeholder_image(), operation_log)
+                
+        except Exception:
+            raise
+
+
+# Update node registration to include Pro node
+NODE_CLASS_MAPPINGS["ComfyUI_NanoBananaPro"] = ComfyUI_NanoBananaPro
+NODE_DISPLAY_NAME_MAPPINGS["ComfyUI_NanoBananaPro"] = "Nano Banana Pro (Gemini 3 Pro)"
