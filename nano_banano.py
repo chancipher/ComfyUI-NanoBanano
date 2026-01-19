@@ -211,6 +211,11 @@ class ComfyUI_NanoBanana:
                     "step": 64,
                     "tooltip": "Maximum number of tokens in response. For image outputs, typically ~1290 tokens per image."
                 }),
+                "system_instruction": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "System instruction to guide the model's behavior. Sets context, role, or constraints for generation."
+                }),
             }
         }
 
@@ -334,7 +339,8 @@ class ComfyUI_NanoBanana:
     def call_nano_banana_api(self, prompt, ref_pil_images, temperature, top_p, max_output_tokens, batch_count, enable_safety,
                              seed=None, retries=3, debug_logging=False, request_timeout=60.0,
                              timeout_strategy="poll", hard_overall_timeout=0.0, aspect_ratio="1:1",
-                             model_name="gemini-2.5-flash-image", image_size="1K", enable_google_search=False):
+                             model_name="gemini-2.5-flash-image", image_size="1K", enable_google_search=False,
+                             system_instruction=None):
         """Make API call to Gemini image models with retries per batch"""
         overall_t0 = time.perf_counter()
         pre_debug_lines = []
@@ -385,11 +391,18 @@ class ComfyUI_NanoBanana:
                 }
                 if tools:
                     config_kwargs["tools"] = tools
+                # Add system_instruction if provided
+                if system_instruction and system_instruction.strip():
+                    config_kwargs["system_instruction"] = [types.Part.from_text(text=system_instruction.strip())]
+                    print(f"[NanoBanano] ✅ system_instruction added: {len(system_instruction.strip())} chars, preview: \"{system_instruction.strip()[:60]}...\"", flush=True)
+                else:
+                    print(f"[NanoBanano] ⚠️ system_instruction not provided or empty", flush=True)
                 generation_config = types.GenerateContentConfig(**config_kwargs)
                 if seed is not None and seed >= 0:
                     seed_applied = True
-            except TypeError:
+            except TypeError as e:
                 # Fallback for older SDKs without image_config or seed support
+                print(f"[NanoBanano] ❌ Primary config failed: {e}, trying fallback (system_instruction will be LOST)", flush=True)
                 try:
                     generation_config = types.GenerateContentConfig(
                         temperature=temperature,
@@ -398,14 +411,16 @@ class ComfyUI_NanoBanana:
                         response_modalities=['Image'],
                         seed=seed if (seed is not None and seed >= 0) else None
                     )
+                    print(f"[NanoBanano] ⚠️ Fallback 1 used - system_instruction NOT supported", flush=True)
                     if seed is not None and seed >= 0:
                         seed_applied = True
-                except TypeError:
+                except TypeError as e2:
                     generation_config = types.GenerateContentConfig(
                         temperature=temperature,
                         top_p=top_p,
                         response_modalities=['Image']
                     )
+                    print(f"[NanoBanano] ⚠️ Fallback 2 used - system_instruction NOT supported", flush=True)
             pre_debug_lines.append(f"Build generation config: {_fmt_ms(time.perf_counter() - cfg_t0)}")
 
             # NEW: Build contents using required ordering: all images first, then text prompt last
@@ -594,7 +609,8 @@ class ComfyUI_NanoBanana:
     def nano_banana_generate(self, prompt,
                              reference_images=None, api_key="", 
                              batch_count=1, temperature=0.7, top_p=0.95, max_output_tokens=8192, quality="high", aspect_ratio="1:1",
-                             character_consistency=True, enable_safety=True, seed=-1, retries=3, debug_logging=True, request_timeout=60.0, timeout_strategy="poll", hard_overall_timeout=0.0):
+                             character_consistency=True, enable_safety=True, seed=-1, retries=3, debug_logging=True, request_timeout=60.0, timeout_strategy="poll", hard_overall_timeout=0.0,
+                             system_instruction=""):
         outer_t0 = time.perf_counter()
         stage_marks = []
         def _mark(label, tstore=[time.perf_counter()]):
@@ -717,6 +733,8 @@ class ComfyUI_NanoBanana:
             if hard_overall_timeout > 0:
                 emit(f"Overall Hard Timeout: {hard_overall_timeout:.1f}s")
             emit("Note: Output resolution determined by API (max ~1024px)")
+            if system_instruction and system_instruction.strip():
+                emit(f"System Instruction: {system_instruction[:100]}{'...' if len(system_instruction) > 100 else ''}")
             emit(f"Prompt placed last (len={len(final_prompt)}). Preview: {final_prompt[:150]}...\n")
 
             # Pre-API debug timings (outer setup)
@@ -734,7 +752,7 @@ class ComfyUI_NanoBanana:
                 seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging,
                 request_timeout=request_timeout, timeout_strategy=timeout_strategy,
                 hard_overall_timeout=hard_overall_timeout, aspect_ratio=aspect_ratio,
-                model_name=model_name
+                model_name=model_name, system_instruction=system_instruction
             )
             api_secs = time.perf_counter() - api_t0
             # api_log already printed via emit inside call; still append the returned log
@@ -889,6 +907,11 @@ class ComfyUI_NanoBananaPro(ComfyUI_NanoBanana):
                     "step": 64,
                     "tooltip": "Maximum number of tokens in response."
                 }),
+                "system_instruction": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "System instruction to guide the model's behavior. Sets context, role, or constraints for generation."
+                }),
             }
         }
 
@@ -903,7 +926,8 @@ class ComfyUI_NanoBananaPro(ComfyUI_NanoBanana):
                                  batch_count=1, temperature=0.7, top_p=0.95, max_output_tokens=8192, 
                                  quality="high", aspect_ratio="1:1", image_size="1K", enable_google_search=False,
                                  character_consistency=True, enable_safety=True, seed=-1, retries=3, 
-                                 debug_logging=True, request_timeout=120.0, timeout_strategy="poll", hard_overall_timeout=0.0):
+                                 debug_logging=True, request_timeout=120.0, timeout_strategy="poll", hard_overall_timeout=0.0,
+                                 system_instruction=""):
         outer_t0 = time.perf_counter()
         stage_marks = []
         def _mark(label, tstore=[time.perf_counter()]):
@@ -1021,6 +1045,8 @@ class ComfyUI_NanoBananaPro(ComfyUI_NanoBanana):
             if hard_overall_timeout > 0:
                 emit(f"Overall Hard Timeout: {hard_overall_timeout:.1f}s")
             emit("Note: Pro model uses Thinking mode for complex prompts and supports up to 4K output")
+            if system_instruction and system_instruction.strip():
+                emit(f"System Instruction: {system_instruction[:100]}{'...' if len(system_instruction) > 100 else ''}")
             emit(f"Prompt preview: {final_prompt[:150]}...\n")
 
             # Pre-API debug timings
@@ -1038,7 +1064,8 @@ class ComfyUI_NanoBananaPro(ComfyUI_NanoBanana):
                 seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging,
                 request_timeout=request_timeout, timeout_strategy=timeout_strategy,
                 hard_overall_timeout=hard_overall_timeout, aspect_ratio=aspect_ratio,
-                model_name=model_name, image_size=image_size, enable_google_search=enable_google_search
+                model_name=model_name, image_size=image_size, enable_google_search=enable_google_search,
+                system_instruction=system_instruction
             )
             api_secs = time.perf_counter() - api_t0
             operation_log += api_log
