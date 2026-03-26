@@ -104,8 +104,9 @@ def _decode_image_to_numpy(img_bytes, mime_hint=""):
     raise ValueError(f"Failed to decode image (mime={mime_hint}) with PIL/ OpenCV/ base64.")
 
 class ComfyUI_NanoBanana:
-    def __init__(self, api_key=None):
+    def __init__(self, api_key=None, base_url=None):
         env_key = os.environ.get("GEMINI_API_KEY")
+        env_base_url = os.environ.get("GEMINI_BASE_URL")
         
         # Common placeholder values to ignore
         placeholders = {"token_here", "place_token_here", "your_api_key",
@@ -118,6 +119,8 @@ class ComfyUI_NanoBanana:
             if self.api_key is None:
                 config = get_config()
                 self.api_key = config.get("GEMINI_API_KEY")
+        
+        self.base_url = base_url or env_base_url or None
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -360,7 +363,16 @@ class ComfyUI_NanoBanana:
             sdk_t0 = time.perf_counter()
             from google import genai
             from google.genai import types
-            client = genai.Client(api_key=self.api_key)
+            
+            # Support custom base_url for proxy (e.g., Kong gateway)
+            if self.base_url:
+                client = genai.Client(
+                    api_key=self.api_key,
+                    http_options={"api_version": "v1beta", "base_url": self.base_url}
+                )
+                pre_debug_lines.append(f"Using proxy: {self.base_url}")
+            else:
+                client = genai.Client(api_key=self.api_key)
             pre_debug_lines.append(f"SDK client init: {_fmt_ms(time.perf_counter() - sdk_t0)}")
 
             # Determine if using Pro model or Gemini 3.x image model (supports image_size)
