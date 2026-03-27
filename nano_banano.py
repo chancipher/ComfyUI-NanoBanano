@@ -285,23 +285,23 @@ class ComfyUI_NanoBanana:
                 single_image = images[i]  # (H, W, C)
                 pil_image = self.tensor_to_image(single_image)
                 pil_image = self.resize_image(pil_image, max_size=2048)
-                # size estimate (encode to PNG once for logging only)
+                # size estimate (encode to JPEG once for logging only)
                 buf = BytesIO()
-                pil_image.save(buf, format="PNG")
+                pil_image.save(buf, format="JPEG", quality=95)
                 total_bytes += len(buf.getvalue())
                 pil_images.append(pil_image)
                 
         return pil_images, total_bytes
 
     def _image_to_base64(self, pil_image):
-        """Convert PIL image to raw PNG bytes payload expected by SDK"""
+        """Convert PIL image to raw JPEG bytes payload expected by SDK"""
         img_byte_arr = BytesIO()
-        pil_image.save(img_byte_arr, format='PNG')
+        pil_image.save(img_byte_arr, format='JPEG', quality=95)
         img_bytes = img_byte_arr.getvalue()
         # Return bytes directly; SDK will wrap as Blob
         return {
             "inline_data": {
-                "mime_type": "image/png",
+                "mime_type": "image/jpeg",
                 "data": img_bytes,  # bytes, not base64 string
             }
         }
