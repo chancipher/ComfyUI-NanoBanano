@@ -133,9 +133,19 @@ class ComfyUI_NanoBanana:
                 }),
             },
             "optional": {
-                "reference_images": ("IMAGE", {
-                    "forceInput": False,
-                    "tooltip": "Reference images for editing/style transfer (supports batch, max 3 images per API docs)"
+                "reference_image_1": ("IMAGE", {
+                    "tooltip": "Reference image 1"
+                }),
+                "reference_image_2": ("IMAGE", {
+                    "tooltip": "Reference image 2"
+                }),
+                "reference_image_3": ("IMAGE", {
+                    "tooltip": "Reference image 3"
+                }),
+                "reference_image_urls": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Newline-separated image URLs. If provided, these take priority over reference_image inputs."
                 }),
                 "api_key": ("STRING", {
                     "default": "",
@@ -267,31 +277,58 @@ class ComfyUI_NanoBanana:
     def prepare_images_for_api(self, images=None):
         """Return (list_of_PIL_images, total_png_payload_bytes_estimate) per new SDK usage.
         
-        Accepts a batch tensor of shape (B, H, W, C) and processes all images in the batch.
+        Accepts a batch tensor of shape (B, H, W, C) or a list of tensors (possibly different sizes).
         """
         pil_images = []
         total_bytes = 0
         
         if images is None:
             return pil_images, total_bytes
-            
-        if isinstance(images, torch.Tensor):
-            # Ensure 4D tensor (B, H, W, C)
+
+        # Normalize to list of 3D tensors (H, W, C)
+        tensor_list = []
+        if isinstance(images, (list, tuple)):
+            for t in images:
+                if isinstance(t, torch.Tensor):
+                    if t.ndim == 4:
+                        for j in range(t.shape[0]):
+                            tensor_list.append(t[j])
+                    elif t.ndim == 3:
+                        tensor_list.append(t)
+        elif isinstance(images, torch.Tensor):
             if images.ndim == 3:
                 images = images.unsqueeze(0)
-            
-            batch_size = images.shape[0]
-            for i in range(batch_size):
-                single_image = images[i]  # (H, W, C)
-                pil_image = self.tensor_to_image(single_image)
-                pil_image = self.resize_image(pil_image, max_size=2048)
-                # size estimate (encode to JPEG once for logging only)
-                buf = BytesIO()
-                pil_image.save(buf, format="JPEG", quality=95)
-                total_bytes += len(buf.getvalue())
-                pil_images.append(pil_image)
+            for j in range(images.shape[0]):
+                tensor_list.append(images[j])
+
+        min_dim = 32
+        for i, single_image in enumerate(tensor_list):
+            h, w = single_image.shape[0], single_image.shape[1]
+            if h < min_dim or w < min_dim:
+                print(f"[NanoBanano] Skipping reference image {i+1}: too small ({w}x{h}, min {min_dim}px)", flush=True)
+                continue
+            # Skip solid color images (all black, all white, or uniform)
+            img_min = single_image.min().item()
+            img_max = single_image.max().item()
+            if img_max - img_min < 1.0 / 255.0:
+                print(f"[NanoBanano] Skipping reference image {i+1}: solid color (min={img_min:.4f}, max={img_max:.4f})", flush=True)
+                continue
+            pil_image = self.tensor_to_image(single_image)
+            pil_image = self.resize_image(pil_image, max_size=2048)
+            # size estimate (encode to JPEG once for logging only)
+            buf = BytesIO()
+            pil_image.save(buf, format="JPEG", quality=95)
+            total_bytes += len(buf.getvalue())
+            pil_images.append(pil_image)
                 
         return pil_images, total_bytes
+
+    def _parse_image_urls(self, urls_text, max_urls=14):
+        """Parse newline-separated URLs text into a list of URL strings."""
+        if not urls_text or not urls_text.strip():
+            return []
+        urls = [u.strip() for u in urls_text.strip().splitlines() if u.strip()]
+        return urls[:max_urls]
 
     def _image_to_base64(self, pil_image):
         """Convert PIL image to raw JPEG bytes payload expected by SDK"""
@@ -307,24 +344,8 @@ class ComfyUI_NanoBanana:
         }
 
     def build_prompt(self, prompt, has_references=False, aspect_ratio="1:1", character_consistency=True):
-        aspect_map = {
-            "1:1": "square format",
-            "2:3": "tall portrait format",
-            "3:2": "wide landscape format",
-            "3:4": "standard portrait format",
-            "4:3": "standard landscape format",
-            "4:5": "portrait format",
-            "5:4": "landscape format",
-            "9:16": "portrait format",
-            "16:9": "widescreen landscape format",
-            "21:9": "ultra-wide landscape format"
-        }
-        parts = [prompt.strip()]
-        if aspect_ratio in aspect_map:
-            parts.append(f"(Use {aspect_map[aspect_ratio]})")
-        if has_references and character_consistency:
-            parts.append("Maintain visual/character consistency with the reference image(s).")
-        return " ".join(parts).strip()
+        """Pass prompt through without modification."""
+        return prompt.strip()
 
     def _normalize_seed(self, seed):
         """Normalize any large seed into 32-bit non-negative range"""
@@ -343,7 +364,7 @@ class ComfyUI_NanoBanana:
                              seed=None, retries=3, debug_logging=False, request_timeout=60.0,
                              timeout_strategy="poll", hard_overall_timeout=0.0, aspect_ratio="1:1",
                              model_name="gemini-2.5-flash-image", image_size="1K", enable_google_search=False,
-                             system_instruction=None):
+                             system_instruction=None, ref_image_urls=None):
         """Make API call to Gemini image models with retries per batch"""
         overall_t0 = time.perf_counter()
         pre_debug_lines = []
@@ -439,13 +460,23 @@ class ComfyUI_NanoBanana:
 
             # NEW: Build contents using required ordering: all images first, then text prompt last
             parts_t0 = time.perf_counter()
-            # Previously: contents = [prompt] + ref_pil_images
-            contents = list(ref_pil_images) + [prompt]  # images first, text last
+            if ref_image_urls:
+                # Use URL-based reference images directly via types.Part.from_uri
+                url_parts = []
+                for _url in ref_image_urls:
+                    url_parts.append(types.Part.from_uri(file_uri=_url, mime_type='image/jpeg'))
+                contents = url_parts + [prompt]
+                pre_debug_lines.append(
+                    f"Build contents(URL refs->text): {_fmt_ms(time.perf_counter() - parts_t0)} "
+                    f"(prompt_len={len(prompt)}, ref_urls={len(ref_image_urls)})"
+                )
+            else:
+                contents = list(ref_pil_images) + [prompt]  # images first, text last
+                pre_debug_lines.append(
+                    f"Build contents(list, imgs->text): {_fmt_ms(time.perf_counter() - parts_t0)} "
+                    f"(prompt_len={len(prompt)}, ref_images={len(ref_pil_images)})"
+                )
             total_input_image_bytes = 0
-            pre_debug_lines.append(
-                f"Build contents(list, imgs->text): {_fmt_ms(time.perf_counter() - parts_t0)} "
-                f"(prompt_len={len(prompt)}, ref_images={len(ref_pil_images)})"
-            )
 
             if debug_logging and pre_debug_lines:
                 emit("DEBUG TIMINGS (SDK/build):")
@@ -621,7 +652,9 @@ class ComfyUI_NanoBanana:
             raise RuntimeError(f"Error in v6 method: {str(e)}") from e
 
     def nano_banana_generate(self, prompt,
-                             reference_images=None, api_key="", 
+                             reference_image_1=None, reference_image_2=None, reference_image_3=None,
+                             reference_image_urls="",
+                             api_key="", 
                              batch_count=1, temperature=0.7, top_p=0.95, max_output_tokens=8192, quality="high", aspect_ratio="1:1",
                              character_consistency=True, enable_safety=True, seed=-1, retries=3, debug_logging=True, request_timeout=60.0, timeout_strategy="poll", hard_overall_timeout=0.0,
                              system_instruction=""):
@@ -675,39 +708,41 @@ class ComfyUI_NanoBanana:
                     pass
             _mark("Seed normalization/setup")
 
-            # Process reference images (batch tensor)
-            ref_shapes = []
-            if isinstance(reference_images, torch.Tensor):
-                # Ensure 4D tensor (B, H, W, C)
-                if reference_images.ndim == 3:
-                    reference_images = reference_images.unsqueeze(0)
-                batch_size = reference_images.shape[0]
-                
-                # Warn if too many reference images (Flash model limit: 3 per API docs)
-                if batch_size > max_ref_images:
-                    emit(f"WARNING: {batch_size} reference images provided, but {model_display} only accepts up to {max_ref_images} (API limit). Using first {max_ref_images}.")
-                    reference_images = reference_images[:max_ref_images]
-                    batch_size = max_ref_images
-                
-                for i in range(batch_size):
-                    ref_shapes.append((i + 1, tuple(reference_images[i].shape)))
-            ref_images, enc_bytes = self.prepare_images_for_api(reference_images)
-            has_references = len(ref_images) > 0
+            # Parse URL-based reference images
+            _parsed_urls = self._parse_image_urls(reference_image_urls, max_urls=max_ref_images)
+            if _parsed_urls:
+                emit(f"Using {len(_parsed_urls)} reference image URL(s) (priority over tensor inputs)")
+                for _ui, _u in enumerate(_parsed_urls):
+                    emit(f"  URL {_ui+1}: {_u[:100]}")
+                ref_images = []
+                enc_bytes = 0
+                has_references = True
+            else:
+                _parsed_urls = []
+                # Collect individual reference images into list
+                _ref_list = []
+                for _ri in [reference_image_1, reference_image_2, reference_image_3]:
+                    if _ri is not None and isinstance(_ri, torch.Tensor):
+                        _ref_list.append(_ri)
+
+                # Process reference images
+                ref_shapes = []
+                _idx = 0
+                for _ri in _ref_list:
+                    t = _ri.unsqueeze(0) if _ri.ndim == 3 else _ri
+                    for j in range(t.shape[0]):
+                        ref_shapes.append((_idx + 1, tuple(t[j].shape)))
+                        _idx += 1
+                if _idx > max_ref_images:
+                    emit(f"WARNING: {_idx} reference images provided, but {model_display} only accepts up to {max_ref_images} (API limit). Using first {max_ref_images}.")
+                    _ref_list = _ref_list[:max_ref_images]
+                ref_images, enc_bytes = self.prepare_images_for_api(_ref_list)
+                has_references = len(ref_images) > 0
             _mark("Encode reference images")
 
-            # Build prompt (was build_prompt_for_operation)
-            final_prompt = self.build_prompt(
-                prompt, has_references, aspect_ratio, character_consistency
-            )
+            # Pass prompt through without modification
+            final_prompt = prompt.strip()
             _mark("Build prompt")
-            
-            if "Error:" in final_prompt:
-                return (self.create_placeholder_image(), final_prompt)
-            
-            # Add quality instructions
-            if quality == "high":
-                final_prompt += " Use the highest quality settings available."
-            _mark("Attach quality")
 
             # Log operation start (print header immediately)
             emit(f"NANO BANANA OPERATION LOG - {model_display}")
@@ -766,7 +801,8 @@ class ComfyUI_NanoBanana:
                 seed=norm_seed, retries=int(max(1, retries)), debug_logging=debug_logging,
                 request_timeout=request_timeout, timeout_strategy=timeout_strategy,
                 hard_overall_timeout=hard_overall_timeout, aspect_ratio=aspect_ratio,
-                model_name=model_name, system_instruction=system_instruction
+                model_name=model_name, system_instruction=system_instruction,
+                ref_image_urls=_parsed_urls
             )
             api_secs = time.perf_counter() - api_t0
             # api_log already printed via emit inside call; still append the returned log
@@ -832,9 +868,52 @@ class ComfyUI_NanoBananaPro(ComfyUI_NanoBanana):
                 }),
             },
             "optional": {
-                "reference_images": ("IMAGE", {
-                    "forceInput": False,
-                    "tooltip": "Reference images for editing/style transfer (supports batch, up to 14 images for Pro)"
+                "reference_image_1": ("IMAGE", {
+                    "tooltip": "Reference image 1"
+                }),
+                "reference_image_2": ("IMAGE", {
+                    "tooltip": "Reference image 2"
+                }),
+                "reference_image_3": ("IMAGE", {
+                    "tooltip": "Reference image 3"
+                }),
+                "reference_image_4": ("IMAGE", {
+                    "tooltip": "Reference image 4"
+                }),
+                "reference_image_5": ("IMAGE", {
+                    "tooltip": "Reference image 5"
+                }),
+                "reference_image_6": ("IMAGE", {
+                    "tooltip": "Reference image 6"
+                }),
+                "reference_image_7": ("IMAGE", {
+                    "tooltip": "Reference image 7"
+                }),
+                "reference_image_8": ("IMAGE", {
+                    "tooltip": "Reference image 8"
+                }),
+                "reference_image_9": ("IMAGE", {
+                    "tooltip": "Reference image 9"
+                }),
+                "reference_image_10": ("IMAGE", {
+                    "tooltip": "Reference image 10"
+                }),
+                "reference_image_11": ("IMAGE", {
+                    "tooltip": "Reference image 11"
+                }),
+                "reference_image_12": ("IMAGE", {
+                    "tooltip": "Reference image 12"
+                }),
+                "reference_image_13": ("IMAGE", {
+                    "tooltip": "Reference image 13"
+                }),
+                "reference_image_14": ("IMAGE", {
+                    "tooltip": "Reference image 14"
+                }),
+                "reference_image_urls": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Newline-separated image URLs. If provided, these take priority over reference_image inputs."
                 }),
                 "api_key": ("STRING", {
                     "default": "",
@@ -936,7 +1015,13 @@ class ComfyUI_NanoBananaPro(ComfyUI_NanoBanana):
     DESCRIPTION = "Generate and edit images using Google's Gemini 3 Pro Image Preview. Supports up to 14 reference images, 4K output, Google Search grounding, and Thinking mode. Requires paid API access."
 
     def nano_banana_pro_generate(self, prompt,
-                                 reference_images=None, api_key="", 
+                                 reference_image_1=None, reference_image_2=None, reference_image_3=None,
+                                 reference_image_4=None, reference_image_5=None, reference_image_6=None,
+                                 reference_image_7=None, reference_image_8=None, reference_image_9=None,
+                                 reference_image_10=None, reference_image_11=None, reference_image_12=None,
+                                 reference_image_13=None, reference_image_14=None,
+                                 reference_image_urls="",
+                                 api_key="", 
                                  batch_count=1, temperature=0.7, top_p=0.95, max_output_tokens=8192, 
                                  quality="high", aspect_ratio="1:1", image_size="1K", enable_google_search=False,
                                  character_consistency=True, enable_safety=True, seed=-1, retries=3, 
@@ -992,37 +1077,45 @@ class ComfyUI_NanoBananaPro(ComfyUI_NanoBanana):
                     pass
             _mark("Seed normalization/setup")
 
-            # Process reference images (batch tensor)
-            ref_shapes = []
-            if isinstance(reference_images, torch.Tensor):
-                if reference_images.ndim == 3:
-                    reference_images = reference_images.unsqueeze(0)
-                batch_size = reference_images.shape[0]
-                
-                # Warn if too many reference images
-                if batch_size > max_ref_images:
-                    emit(f"WARNING: {batch_size} reference images provided, but Pro model supports up to {max_ref_images}. Using first {max_ref_images}.")
-                    reference_images = reference_images[:max_ref_images]
-                    batch_size = max_ref_images
-                
-                for i in range(batch_size):
-                    ref_shapes.append((i + 1, tuple(reference_images[i].shape)))
-            ref_images, enc_bytes = self.prepare_images_for_api(reference_images)
-            has_references = len(ref_images) > 0
+            # Parse URL-based reference images
+            _parsed_urls = self._parse_image_urls(reference_image_urls, max_urls=max_ref_images)
+            if _parsed_urls:
+                emit(f"Using {len(_parsed_urls)} reference image URL(s) (priority over tensor inputs)")
+                for _ui, _u in enumerate(_parsed_urls):
+                    emit(f"  URL {_ui+1}: {_u[:100]}")
+                ref_images = []
+                enc_bytes = 0
+                has_references = True
+            else:
+                _parsed_urls = []
+                # Collect individual reference images into list
+                _ref_list = []
+                for _ri in [reference_image_1, reference_image_2, reference_image_3,
+                            reference_image_4, reference_image_5, reference_image_6,
+                            reference_image_7, reference_image_8, reference_image_9,
+                            reference_image_10, reference_image_11, reference_image_12,
+                            reference_image_13, reference_image_14]:
+                    if _ri is not None and isinstance(_ri, torch.Tensor):
+                        _ref_list.append(_ri)
+
+                # Process reference images
+                ref_shapes = []
+                _idx = 0
+                for _ri in _ref_list:
+                    t = _ri.unsqueeze(0) if _ri.ndim == 3 else _ri
+                    for j in range(t.shape[0]):
+                        ref_shapes.append((_idx + 1, tuple(t[j].shape)))
+                        _idx += 1
+                if _idx > max_ref_images:
+                    emit(f"WARNING: {_idx} reference images provided, but Pro model supports up to {max_ref_images}. Using first {max_ref_images}.")
+                    _ref_list = _ref_list[:max_ref_images]
+                ref_images, enc_bytes = self.prepare_images_for_api(_ref_list)
+                has_references = len(ref_images) > 0
             _mark("Encode reference images")
 
-            # Build prompt
-            final_prompt = self.build_prompt(
-                prompt, has_references, aspect_ratio, character_consistency
-            )
+            # Pass prompt through without modification
+            final_prompt = prompt.strip()
             _mark("Build prompt")
-            
-            if "Error:" in final_prompt:
-                return (self.create_placeholder_image(), final_prompt)
-            
-            if quality == "high":
-                final_prompt += " Use the highest quality settings available."
-            _mark("Attach quality")
 
             # Log operation start
             emit(f"NANO BANANA PRO OPERATION LOG - {model_display}")
@@ -1079,7 +1172,7 @@ class ComfyUI_NanoBananaPro(ComfyUI_NanoBanana):
                 request_timeout=request_timeout, timeout_strategy=timeout_strategy,
                 hard_overall_timeout=hard_overall_timeout, aspect_ratio=aspect_ratio,
                 model_name=model_name, image_size=image_size, enable_google_search=enable_google_search,
-                system_instruction=system_instruction
+                system_instruction=system_instruction, ref_image_urls=_parsed_urls
             )
             api_secs = time.perf_counter() - api_t0
             operation_log += api_log
@@ -1125,9 +1218,40 @@ class ComfyUI_NanoBanana2(ComfyUI_NanoBanana):
                 }),
             },
             "optional": {
-                "reference_images": ("IMAGE", {
-                    "forceInput": False,
-                    "tooltip": "Reference images for editing/style transfer (supports batch)"
+                "reference_image_1": ("IMAGE", {
+                    "tooltip": "Reference image 1"
+                }),
+                "reference_image_2": ("IMAGE", {
+                    "tooltip": "Reference image 2"
+                }),
+                "reference_image_3": ("IMAGE", {
+                    "tooltip": "Reference image 3"
+                }),
+                "reference_image_4": ("IMAGE", {
+                    "tooltip": "Reference image 4"
+                }),
+                "reference_image_5": ("IMAGE", {
+                    "tooltip": "Reference image 5"
+                }),
+                "reference_image_6": ("IMAGE", {
+                    "tooltip": "Reference image 6"
+                }),
+                "reference_image_7": ("IMAGE", {
+                    "tooltip": "Reference image 7"
+                }),
+                "reference_image_8": ("IMAGE", {
+                    "tooltip": "Reference image 8"
+                }),
+                "reference_image_9": ("IMAGE", {
+                    "tooltip": "Reference image 9"
+                }),
+                "reference_image_10": ("IMAGE", {
+                    "tooltip": "Reference image 10"
+                }),
+                "reference_image_urls": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Newline-separated image URLs. If provided, these take priority over reference_image inputs."
                 }),
                 "api_key": ("STRING", {
                     "default": "",
@@ -1229,7 +1353,12 @@ class ComfyUI_NanoBanana2(ComfyUI_NanoBanana):
     DESCRIPTION = "Generate and edit images using Google's Gemini 3.1 Flash Image Preview. High-volume, high-efficiency model with lower cost. Supports 4K output, Google Search + Image Search grounding, and conversational editing. Requires paid API access."
 
     def nano_banana_2_generate(self, prompt,
-                               reference_images=None, api_key="", 
+                               reference_image_1=None, reference_image_2=None, reference_image_3=None,
+                               reference_image_4=None, reference_image_5=None, reference_image_6=None,
+                               reference_image_7=None, reference_image_8=None, reference_image_9=None,
+                               reference_image_10=None,
+                               reference_image_urls="",
+                               api_key="", 
                                batch_count=1, temperature=1.0, top_p=0.95, max_output_tokens=8192, 
                                quality="high", aspect_ratio="1:1", image_size="1K", enable_google_search=False,
                                character_consistency=True, enable_safety=True, seed=-1, retries=3, 
@@ -1285,37 +1414,44 @@ class ComfyUI_NanoBanana2(ComfyUI_NanoBanana):
                     pass
             _mark("Seed normalization/setup")
 
-            # Process reference images (batch tensor)
-            ref_shapes = []
-            if isinstance(reference_images, torch.Tensor):
-                if reference_images.ndim == 3:
-                    reference_images = reference_images.unsqueeze(0)
-                batch_size = reference_images.shape[0]
-                
-                # Warn if too many reference images
-                if batch_size > max_ref_images:
-                    emit(f"WARNING: {batch_size} reference images provided, using first {max_ref_images}.")
-                    reference_images = reference_images[:max_ref_images]
-                    batch_size = max_ref_images
-                
-                for i in range(batch_size):
-                    ref_shapes.append((i + 1, tuple(reference_images[i].shape)))
-            ref_images, enc_bytes = self.prepare_images_for_api(reference_images)
-            has_references = len(ref_images) > 0
+            # Parse URL-based reference images
+            _parsed_urls = self._parse_image_urls(reference_image_urls, max_urls=max_ref_images)
+            if _parsed_urls:
+                emit(f"Using {len(_parsed_urls)} reference image URL(s) (priority over tensor inputs)")
+                for _ui, _u in enumerate(_parsed_urls):
+                    emit(f"  URL {_ui+1}: {_u[:100]}")
+                ref_images = []
+                enc_bytes = 0
+                has_references = True
+            else:
+                _parsed_urls = []
+                # Collect individual reference images into list
+                _ref_list = []
+                for _ri in [reference_image_1, reference_image_2, reference_image_3,
+                            reference_image_4, reference_image_5, reference_image_6,
+                            reference_image_7, reference_image_8, reference_image_9,
+                            reference_image_10]:
+                    if _ri is not None and isinstance(_ri, torch.Tensor):
+                        _ref_list.append(_ri)
+
+                # Process reference images
+                ref_shapes = []
+                _idx = 0
+                for _ri in _ref_list:
+                    t = _ri.unsqueeze(0) if _ri.ndim == 3 else _ri
+                    for j in range(t.shape[0]):
+                        ref_shapes.append((_idx + 1, tuple(t[j].shape)))
+                        _idx += 1
+                if _idx > max_ref_images:
+                    emit(f"WARNING: {_idx} reference images provided, using first {max_ref_images}.")
+                    _ref_list = _ref_list[:max_ref_images]
+                ref_images, enc_bytes = self.prepare_images_for_api(_ref_list)
+                has_references = len(ref_images) > 0
             _mark("Encode reference images")
 
-            # Build prompt
-            final_prompt = self.build_prompt(
-                prompt, has_references, aspect_ratio, character_consistency
-            )
+            # Pass prompt through without modification
+            final_prompt = prompt.strip()
             _mark("Build prompt")
-            
-            if "Error:" in final_prompt:
-                return (self.create_placeholder_image(), final_prompt)
-            
-            if quality == "high":
-                final_prompt += " Use the highest quality settings available."
-            _mark("Attach quality")
 
             # Log operation start
             emit(f"NANO BANANA 2 OPERATION LOG - {model_display}")
@@ -1372,7 +1508,7 @@ class ComfyUI_NanoBanana2(ComfyUI_NanoBanana):
                 request_timeout=request_timeout, timeout_strategy=timeout_strategy,
                 hard_overall_timeout=hard_overall_timeout, aspect_ratio=aspect_ratio,
                 model_name=model_name, image_size=image_size, enable_google_search=enable_google_search,
-                system_instruction=system_instruction
+                system_instruction=system_instruction, ref_image_urls=_parsed_urls
             )
             api_secs = time.perf_counter() - api_t0
             operation_log += api_log
