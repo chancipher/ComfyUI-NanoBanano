@@ -105,7 +105,7 @@ def _decode_image_to_numpy(img_bytes, mime_hint=""):
 
 class ComfyUI_NanoBanana:
     def __init__(self, api_key=None, base_url=None):
-        env_key = os.environ.get("GEMINI_API_KEY")
+        env_key = os.environ.get("GOOGLE_API_KEY")
         env_base_url = os.environ.get("GEMINI_BASE_URL")
         
         # Common placeholder values to ignore
@@ -118,7 +118,7 @@ class ComfyUI_NanoBanana:
             self.api_key = api_key
             if self.api_key is None:
                 config = get_config()
-                self.api_key = config.get("GEMINI_API_KEY")
+                self.api_key = config.get("GOOGLE_API_KEY")
         
         self.base_url = base_url or env_base_url or None
 
@@ -684,7 +684,7 @@ class ComfyUI_NanoBanana:
         # Validate and set API key
         if api_key.strip():
             self.api_key = api_key
-            save_config({"GEMINI_API_KEY": self.api_key})
+            save_config({"GOOGLE_API_KEY": self.api_key})
         _mark("API key validation")
 
         if not self.api_key:
@@ -1053,7 +1053,7 @@ class ComfyUI_NanoBananaPro(ComfyUI_NanoBanana):
         # Validate and set API key
         if api_key.strip():
             self.api_key = api_key
-            save_config({"GEMINI_API_KEY": self.api_key})
+            save_config({"GOOGLE_API_KEY": self.api_key})
         _mark("API key validation")
 
         if not self.api_key:
@@ -1390,7 +1390,7 @@ class ComfyUI_NanoBanana2(ComfyUI_NanoBanana):
         # Validate and set API key
         if api_key.strip():
             self.api_key = api_key
-            save_config({"GEMINI_API_KEY": self.api_key})
+            save_config({"GOOGLE_API_KEY": self.api_key})
         _mark("API key validation")
 
         if not self.api_key:
